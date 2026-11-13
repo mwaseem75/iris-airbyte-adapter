@@ -1,0 +1,4 @@
+set sc = ##class(%EnsembleMgr).EnableNamespace("USER", 1)
+if $system.Status.IsError(sc) { do $system.Status.DisplayError(sc) do $system.Process.Terminate($job,1) }
+do ##class(Security.Users).UnExpireUserPasswords("*")
+halt
