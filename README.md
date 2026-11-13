@@ -4,6 +4,8 @@ Load data from Airbyte sources into InterSystems IRIS, set up and run entirely f
 
 > **Status: working prototype.** The IRIS storage part (package `Airbyte.Demo`) is prototype code. The extraction worker is designed to be framework-independent.
 
+**To try it, follow [DEMO.md](DEMO.md).**
+
 ![Architecture](demo/architecture.png)
 
 ## How it works
@@ -60,7 +62,7 @@ Other helpers: `Airbyte.Demo.Util` `Runs()`, `State()`, `Reset()`. To reset the 
 
 Management Portal: http://localhost:52773/csp/sys/UtilHome.csp (local demo login `_SYSTEM` / `SYS`). The Message Viewer shows each run as Extract → Store messages.
 
-Design notes: [`docs/design.md`](docs/design.md).
+Step-by-step walkthrough with expected results: [`DEMO.md`](DEMO.md). Design notes: [`docs/design.md`](docs/design.md).
 
 ## Tested versions
 
