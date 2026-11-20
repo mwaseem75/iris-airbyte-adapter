@@ -159,7 +159,7 @@ ClassMethod Discover()
 ClassMethod Runs()
 {
     Write !
-    Do ##class(%SQL.Statement).%ExecDirect(, "SELECT RunId, ConnectionId AS Conn, Status, RecordsRead AS Rd, Inserted AS Ins, Updated AS Upd, Unchanged AS Unch, Rejected AS Rej, RetryCount AS Retries, ErrorCategory AS ErrCat, DurationSeconds AS Secs FROM Airbyte_Demo_Data.Run ORDER BY ID").%Display()
+    Do ##class(%SQL.Statement).%ExecDirect(, "SELECT RunId, ConnectionId AS Conn, Status, RecordsRead AS Rd, Inserted AS Ins, Updated AS Upd, Unchanged AS Unch, Rejected AS Rej, RetryCount AS Retries, ErrorCategory AS ErrCat, DurationSeconds AS Secs, StoreSeconds AS StoreSecs FROM Airbyte_Demo_Data.Run ORDER BY ID").%Display()
 }
 
 /// Counts per stream for one run
@@ -211,6 +211,24 @@ ClassMethod State(pConnectionId As %String = "demo")
 }
 
 /// Forget everything IRIS stored (records, runs, state). Also reset the source: demo/scenarios/00_reset_source.sql
+/// Remove the records, runs, rejected records, status and saved state of ONE connection (other connections
+/// are not touched). Use it to start a connection from scratch, for example before a benchmark.
+ClassMethod ResetConnection(pConnectionId As %String)
+{
+    If pConnectionId = "" {
+        Write !,"ResetConnection needs a connection id",!
+        Quit
+    }
+    // runs go with their per-stream counts; the record and rejected tables hold the connection id themselves
+    &sql(DELETE FROM Airbyte_Demo_Data.RunStream WHERE RunId IN (SELECT ID FROM Airbyte_Demo_Data.Run WHERE ConnectionId = :pConnectionId))
+    &sql(DELETE FROM Airbyte_Demo_Data.Run WHERE ConnectionId = :pConnectionId)
+    &sql(DELETE FROM Airbyte_Demo_Data.Record WHERE ConnectionId = :pConnectionId)
+    &sql(DELETE FROM Airbyte_Demo_Data.Rejected WHERE ConnectionId = :pConnectionId)
+    &sql(DELETE FROM Airbyte_Demo_Data.ConnectionStatus WHERE ConnectionId = :pConnectionId)
+    Kill ^Airbyte.Demo.State(pConnectionId)
+    Write !,"connection ",pConnectionId," reset: records, runs, rejected records, status and state cleared",!
+}
+
 ClassMethod Reset()
 {
     Do ##class(Airbyte.Demo.Data.Record).%KillExtent()
@@ -218,6 +236,8 @@ ClassMethod Reset()
     Do ##class(Airbyte.Demo.Data.RunStream).%KillExtent()
     Do ##class(Airbyte.Demo.Data.ConnectionStatus).%KillExtent()
     Do ##class(Airbyte.Demo.Data.Rejected).%KillExtent()
+    // %KillExtent leaves the stream data (record data, rejected payloads) behind: clear it as well
+    Kill ^Airbyte.Demo.Data.RecordS, ^Airbyte.Demo.Data.RejectedS
     Kill ^Airbyte.Demo.State
     Write !,"IRIS side reset: records, runs and state cleared",!
 }

@@ -25,6 +25,7 @@ Identity of a record is connection + stream + key, so the same key in two tables
 | `src/cls/Airbyte/Demo/` | IRIS production: service, operation, message, tables, helpers |
 | `iris/` | IRIS image setup |
 | `demo/` | Seed data and live-change scenarios |
+| `bench/` | Benchmark scripts, raw results and [the report](bench/REPORT.md) |
 | `docs/` | Design notes |
 | `docker-compose.yml` | IRIS, Postgres (demo source), worker |
 
@@ -51,6 +52,7 @@ do ##class(Airbyte.Demo.Util).Runs()                // run history with counts, 
 do ##class(Airbyte.Demo.Util).RunDetail(1)          // counts per stream for run 1
 do ##class(Airbyte.Demo.Util).Connections()         // last run and last success per connection
 do ##class(Airbyte.Demo.Util).Rejects()             // records rejected because of a bad key
+do ##class(Airbyte.Demo.Util).ResetConnection("bench") // clear one connection (records, runs, state), keep the others
 do ##class(Airbyte.Demo.Service.Extract).RunNow()   // rerun: 7 read, 7 unchanged, no duplicates
 do ##class(Airbyte.Demo.Util).Key()                 // key ["1"] stored once per stream
 ```
@@ -83,7 +85,7 @@ Step-by-step walkthrough with expected results: [`DEMO.md`](DEMO.md). Design not
 ## Known limits (prototype)
 
 - One tested source: Postgres via `source-postgres`. The IRIS side is connector-neutral (settings `ConnectorName`, `ConnectorVersion`, `ConnectorConfig` as JSON, `CredentialFields`), but the worker only runs connectors listed in `ALLOWED_CONNECTORS` (default `source-postgres`).
-- Each run takes at least about 12 s because the Java connector starts. IRIS stores batches while the worker is still reading; 50,000 rows take about 25-30 s in total.
+- Each run takes at least 20 s because the read process and the Java connector start. IRIS stores batches while the worker is still reading. Measured on a laptop with local Docker: 100,000 rows in 50 to 100 s, one million rows in 12 minutes, and IRIS storing is the slower part (see [bench/REPORT.md](bench/REPORT.md)).
 - Incremental reads need a cursor column (e.g. `updated_at`); Airbyte returns the boundary row again on each run, counted as unchanged.
 - Recovery beyond "state is saved only after commit" is not implemented yet.
 - Demo credentials only; not for production use.

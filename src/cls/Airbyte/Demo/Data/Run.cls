@@ -37,6 +37,10 @@ Property ErrorCategory As %String(MAXLEN = 30);
 /// Wall-clock seconds of the whole run, retries included
 Property DurationSeconds As %Numeric(SCALE = 2);
 
+/// Seconds the Store operation spent on this run's batches (all attempts). DurationSeconds minus this is
+/// mostly extraction and waiting for the worker.
+Property StoreSeconds As %Numeric(SCALE = 2) [ InitialExpression = 0 ];
+
 Index ConnIdx On ConnectionId;
 
 }

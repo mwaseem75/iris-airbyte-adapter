@@ -62,6 +62,10 @@ IRIS does not know which connector it talks to. The Extract service has `Connect
 - **Purge on a schedule.** Message headers and the Event Log still grow with every run. Schedule the standard purge task (`Ens.Util.Tasks.Purge`, System Management Portal > Task Manager) with `NumberOfDaysToKeep` 7, `KeepIntegrity` on and `BodiesToo` on, daily. Keep more days if you need a longer history.
 - **Worker.** After the state is saved, Extract calls `POST /reads/{id}/ack` and the worker deletes the batch files of that read. Each job's temp files (config with credentials, catalog, state) live in a folder of their own that is removed when the job ends, also after a timeout or a cancel; a startup sweep removes anything an earlier crash left. The connector's own log files do not contain the config or credentials (checked by searching `/data` and `/tmp` for the Postgres password after reads).
 
+## Benchmark
+
+`bench/` holds a repeatable benchmark: SQL that creates and changes the table `bench_items` in Postgres, a runner (`run.sh` and `run.ps1`, both call `bench.py`) with the scenarios, the raw results in `bench/results/results.csv` and the written findings in `bench/REPORT.md`. It uses its own connection `bench` (a disabled `ExtractBench` item in the demo production), so demo data is not touched, and `Util.ResetConnection(connectionId)` clears one connection only. The worker reports `bytes_produced` for a read and `duration_seconds` is the whole time it spent on the read; IRIS records the time the Store operation spent per run in `Run.StoreSeconds`. The runner samples `docker stats` and the size of the worker's read folder while a run is active.
+
 ## Rules the code follows
 
 - **State after commit.** The worker returns the new source state but never treats it as committed. IRIS saves it only after every batch is committed. A failed run leaves the state unchanged, so the next run reads again from the old position.
@@ -90,7 +94,8 @@ IRIS does not know which connector it talks to. The Extract service has `Connect
 ## Known limits
 
 - One tested source: Postgres through `source-postgres`.
-- A read takes 11-25 s before the first record because the Java connector starts. Records then arrive quickly (50,000 rows in about 24 s in the worker; about 25-30 s through IRIS, where storing is the slower part).
+- A run takes at least 20 s before the first record is stored: the worker starts a process for the read and the Java connector starts. After that records arrive quickly, and storing in IRIS (about 1,700 records/s for new records on the test machine) is slower than reading (about 7,700 records/s). Measurements: `bench/REPORT.md`.
+- The worker keeps all batch files of a read until the read is acknowledged, so the read folder grows with the size of the read (about 460 bytes of JSON per record; 441 MB for one million rows). Batch files of a cancelled or failed read stay until the worker removes old read folders (it keeps the last 10).
 - A wrong host or a stopped source is reported by the connector as a generic connector error, so it is retried like a temporary error before the run fails.
 - Timestamps from `timestamptz` columns come back in UTC (same instant, original offset not kept).
 - Recovery beyond "state is saved only after commit" is not implemented yet.

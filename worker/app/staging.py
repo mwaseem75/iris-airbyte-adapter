@@ -45,5 +45,8 @@ def read_json(path: Path) -> Any | None:
         return None
 
 
-def write_batch(d: Path, read_id: str, n: int, records: list[dict[str, Any]]) -> None:
-    write_json(d / "batches" / f"{n}.json", {"read_id": read_id, "batch": n, "records": records})
+def write_batch(d: Path, read_id: str, n: int, records: list[dict[str, Any]]) -> int:
+    """Write one batch file; returns its size in bytes."""
+    path = d / "batches" / f"{n}.json"
+    write_json(path, {"read_id": read_id, "batch": n, "records": records})
+    return path.stat().st_size

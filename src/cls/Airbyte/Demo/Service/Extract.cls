@@ -82,12 +82,19 @@ Method OnProcessInput(pInput As %RegisteredObject, Output pOutput As %Registered
 }
 
 /// Start one run now (production must be running). Prints a summary. pItem is the name of the Extract
-/// item in the production (a second connection uses its own item).
-ClassMethod RunNow(pVerbose As %Boolean = 1, pItem As %String = "Extract") As %Status
+/// item in the production (a second connection uses its own item). pBatchSize overrides the BatchSize
+/// setting for this run only, and so does pMode (used by the benchmark).
+ClassMethod RunNow(pVerbose As %Boolean = 1, pItem As %String = "Extract", pBatchSize As %Integer = "", pMode As %String = "") As %Status
 {
     Set tSC = ##class(Ens.Director).CreateBusinessService(pItem, .tService)
     If $$$ISERR(tSC) {
         Quit tSC
+    }
+    If pBatchSize '= "" {
+        Set tService.BatchSize = pBatchSize
+    }
+    If pMode '= "" {
+        Set tService.Mode = pMode
     }
     Set tInput = ##class(Ens.StringContainer).%New($Select(pVerbose:"verbose", 1:"quiet"))
     Quit tService.ProcessInput(tInput, .tOutput)

@@ -146,17 +146,19 @@ def op_read(payload: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     trace_error: str | None = None
     batch: list[dict[str, Any]] = []
     batches = 0
+    bytes_out = 0
     batch_size = int(payload.get("batch_size") or 500)
 
     def progress() -> None:
         staging.write_json(out_dir / "progress.json",
-                           {"counts": counts, "key_errors": key_errors, "batches_ready": batches})
+                           {"counts": counts, "key_errors": key_errors, "batches_ready": batches,
+                            "bytes_produced": bytes_out})
 
     def flush() -> None:
-        nonlocal batch, batches
+        nonlocal batch, batches, bytes_out
         if batch:
             batches += 1
-            staging.write_batch(out_dir, read_id, batches, batch)  # file first, then the progress that names it
+            bytes_out += staging.write_batch(out_dir, read_id, batches, batch)  # file first, then the progress that names it
             batch = []
             progress()
 
@@ -208,6 +210,7 @@ def op_read(payload: dict[str, Any], out_dir: Path) -> dict[str, Any]:
         "counts": counts,
         "key_errors": key_errors,
         "batches": batches,
+        "bytes_produced": bytes_out,
         "sync_modes": {n: p["mode"] for n, p in plan.items()},
         "fell_back_to_full_refresh": [n for n, p in plan.items() if p["fallback"]],
         "duration_seconds": round(time.monotonic() - started, 2),

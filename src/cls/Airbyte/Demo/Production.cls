@@ -43,6 +43,19 @@ XData ProductionDefinition
     <Setting Target="Host" Name="Credentials">Postgres</Setting>
     <Setting Target="Host" Name="Target">Store</Setting>
   </Item>
+  <Item Name="ExtractBench" Category="" ClassName="Airbyte.Demo.Service.Extract" PoolSize="1" Enabled="false" Foreground="false" Comment="Benchmark connection, disabled: reads the table bench_items (see bench/). Start it with RunNow(1, &quot;ExtractBench&quot;)" LogTraceEvents="false" Schedule="">
+    <Setting Target="Adapter" Name="CallInterval">3600</Setting>
+    <Setting Target="Host" Name="PollingEnabled">0</Setting>
+    <Setting Target="Host" Name="WorkerURL">http://worker:8000</Setting>
+    <Setting Target="Host" Name="ConnectionId">bench</Setting>
+    <Setting Target="Host" Name="Streams">bench_items</Setting>
+    <Setting Target="Host" Name="CursorFields">bench_items=updated_at</Setting>
+    <Setting Target="Host" Name="Mode">incremental</Setting>
+    <Setting Target="Host" Name="BatchSize">1000</Setting>
+    <Setting Target="Host" Name="ReadTimeout">3600</Setting>
+    <Setting Target="Host" Name="Credentials">Postgres</Setting>
+    <Setting Target="Host" Name="Target">Store</Setting>
+  </Item>
 </Production>
 }
 

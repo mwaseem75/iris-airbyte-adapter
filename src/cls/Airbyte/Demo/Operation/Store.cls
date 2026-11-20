@@ -50,6 +50,7 @@ ClassMethod ProcessBatch(pRequest As Airbyte.Demo.Msg.Batch) As %String
 {
     Set tIns = 0, tUpd = 0, tUnc = 0, tRej = 0
     Set tRunId = pRequest.RunId, tStream = pRequest.Stream
+    Set tT0 = $ZHorolog
     Try {
         Set tRecs = ##class(%DynamicAbstractObject).%FromJSON(pRequest.Records)
         TSTART
@@ -67,8 +68,9 @@ ClassMethod ProcessBatch(pRequest As Airbyte.Demo.Msg.Batch) As %String
             }
         }
         Set tRead = tIns + tUpd + tUnc + tRej
+        Set tSecs = $Number($ZHorolog - tT0, 3)
         &sql(UPDATE Airbyte_Demo_Data.Run
-             SET Inserted = Inserted + :tIns, Updated = Updated + :tUpd,
+             SET StoreSeconds = StoreSeconds + :tSecs, Inserted = Inserted + :tIns, Updated = Updated + :tUpd,
                  Unchanged = Unchanged + :tUnc, Rejected = Rejected + :tRej
              WHERE ID = :tRunId)
         If SQLCODE < 0 {

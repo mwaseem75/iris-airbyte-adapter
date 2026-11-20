@@ -27,6 +27,10 @@ All notable changes to this project are listed here. The format follows [Keep a 
 - Rejected records: a record with a missing or invalid key is stored in a new `Rejected` table (reason and record data) in the same transaction as its batch, instead of only being counted. `Util.Rejects()` lists them and `Util.IgnoreRejected(id)` marks one as ignored. New `KeyFields` setting (`stream=col1+col2`) for streams without a usable primary key.
 - Data minimisation: the Store setting `ClearBatchBodies` (default on) empties the record data in the stored batch messages once a batch is committed; headers and counts stay for Visual Trace. After the state is saved, IRIS acknowledges the read and the worker deletes its batch files (`POST /reads/{id}/ack`).
 
+- Benchmark in `bench/`: scripts that create and change a test table in Postgres, a runner for ten scenarios (initial loads of 10,000, 100,000 and one million rows, mixed changes, unchanged data, recovery after a cancelled read, ten runs in a row, three batch sizes), the raw results as CSV and a written report with the first local results (`bench/REPORT.md`).
+- `Util.ResetConnection(connectionId)` clears the records, runs, rejected records, status and saved state of one connection and leaves the others alone. A disabled `ExtractBench` item in the demo production reads the benchmark table.
+- The Run table has a new column `StoreSeconds` (time spent storing batches). The worker reports `bytes_produced` for a read. `RunNow` accepts a batch size and a mode for one run.
+
 ### Changed
 
 - `ReadTimeout` now limits the whole run (default 600 s); each HTTP call to the worker has its own 30 s timeout. The Store operation has two jobs.
@@ -38,6 +42,8 @@ All notable changes to this project are listed here. The format follows [Keep a 
 
 ### Fixed
 
+- `Util.Reset()` left the record data of the removed records in IRIS storage (it clears the tables but not their stream data). It now clears that data as well.
+- The worker's `duration_seconds` for a finished read now includes starting the read process; the figure from inside the process is kept as `read_seconds`.
 - Config, catalog and state files that hold credentials were left in the worker's temp folder when a read was cancelled or timed out. Each job now has its own temp folder that is always removed, and the worker removes leftovers at startup.
 - A wrong password is now reported as an authentication error. Before, the worker only said "Connector failed" because the real reason was in the connector's log file; the worker now reads it from there.
 

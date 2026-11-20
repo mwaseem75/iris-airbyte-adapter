@@ -237,6 +237,10 @@ def _execute_read(read_id: str, d: Path, payload: dict[str, Any], connection_id:
     t0 = time.monotonic()
     try:
         result = run_isolated("read", payload, work_dir=d, job_id=read_id)
+        # the job's own figure leaves out starting the child process (importing PyAirbyte takes seconds):
+        # keep it as read_seconds and report the whole time the worker spent as duration_seconds
+        result["read_seconds"] = result.get("duration_seconds")
+        result["duration_seconds"] = round(time.monotonic() - t0, 2)
         _update_status(d, status="completed", **result)
         log.info("read %s completed: counts=%s batches=%s in %ss", read_id, result["counts"],
                  result["batches"], result["duration_seconds"])
