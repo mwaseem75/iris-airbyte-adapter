@@ -23,10 +23,11 @@ Extraction runs outside IRIS on purpose: connectors bring their own runtimes (Ja
 | GET | `/health`, `/env` | Liveness; versions |
 | POST | `/check` | Validate config and connection |
 | POST | `/discover` | Streams, schemas, primary keys, sync modes |
-| POST | `/reads` | Read selected streams; body carries config, streams, mode, batch size and the input state |
-| GET | `/reads/{id}` | Status and counts |
-| GET | `/reads/{id}/batches/{n}` | One batch of records |
-| GET | `/reads/{id}/state` | Source state after the read |
+| POST | `/reads` | Start a read; body carries config, streams, mode, batch size, input state, optional `connection_id` and `wait` (default `true`). `wait=true`: returns the full result when done. `wait=false`: returns `202 {read_id, status: "running"}` at once |
+| GET | `/reads/{id}` | Status (`running`, `completed`, `failed`, `cancelled`) with progress: records so far per stream, key errors, `batches_ready`. Final counts, batches, sync modes and duration when completed; `error {category, message}` when failed |
+| GET | `/reads/{id}/batches/{n}` | One batch of records; available as soon as it is written, also while the read runs. `409 not_ready` if not written yet and the read is running; `404` if the read has finished and has no batch n |
+| GET | `/reads/{id}/state` | Source state after the read; only for completed reads |
+| DELETE | `/reads/{id}` | Stop a running read (kills its process and its connector container); status becomes `cancelled`, no state. `409 not_running` for a finished read |
 
 Record format:
 
@@ -48,8 +49,11 @@ Record format:
 
 - Each read gets its own working folder; nothing is reused between reads. The input state comes only from the request.
 - The worker runs the connector and parses its output lines directly, so numbers keep their exact text.
-- A read runs in a child process with a timeout (default 120 s). On timeout the process and the connector container are stopped and the API returns a `timeout` error.
-- One connector operation at a time; a second request gets `409 busy`.
+- A read runs in a child process with a timeout (default 120 s). On timeout the process and its connector container are stopped; status becomes `failed` with category `timeout` (with `wait=true` the API answers 504).
+- Batch files are written while the connector streams records, and `progress.json` is updated after each one. `GET /reads/{id}` merges `status.json` and `progress.json`; a caller can fetch batch 1 while the read is still running. The state is written only at the end of a successful read, and `committed` is always false.
+- `wait=false` runs the read in a background thread of the worker. A read that was running when the worker restarted is marked `failed` (internal) at startup.
+- Concurrency: at most one active read per `connection_id` (409 `busy`), and at most `MAX_CONCURRENT_READS` (default 2) operations in total; check and discover count too. Each connector container gets the label `airbyte-worker-job=<read_id>`, so timeout and cancel kill only that read's container.
+- Logging: one line when a read starts and one when it ends (status, counts, batches, duration); no credentials or record data.
 
 ## Sync modes
 
@@ -59,7 +63,7 @@ Record format:
 ## Known limits
 
 - One tested source: Postgres through `source-postgres`.
-- Reads are synchronous; each read takes about 25 s because the Java connector starts.
+- A read takes 11-25 s before the first record because the Java connector starts. Records then arrive quickly (50,000 rows in about 24 s in total on a laptop).
 - Timestamps from `timestamptz` columns come back in UTC (same instant, original offset not kept).
 - Rejected records are counted and logged, not stored.
 - Recovery beyond "state is saved only after commit" is not implemented yet.

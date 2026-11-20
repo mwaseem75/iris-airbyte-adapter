@@ -5,11 +5,13 @@ from __future__ import annotations
 import functools
 import importlib.metadata as md
 import logging
+import os
 import platform
 import subprocess
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, Request
@@ -18,18 +20,26 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app import staging
-from app.isolation import READ_TIMEOUT_SECONDS, WorkerError, run_isolated
+from app.isolation import READ_TIMEOUT_SECONDS, WorkerError, cancel as cancel_job, run_isolated
 
 DEFAULT_CONNECTOR = "source-postgres"
 DEFAULT_VERSION = "3.8.11"
 ALLOWED_CONNECTORS = {DEFAULT_CONNECTOR}  # only connectors that have been tested
 
+# limit for all connector operations together: reads, check and discover
+MAX_CONCURRENT_READS = max(1, int(os.getenv("MAX_CONCURRENT_READS", "2")))
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("worker")
 app = FastAPI(title="iris-airbyte-adapter worker")
-_busy = threading.Lock()  # one connector operation at a time
 
-STATUS_FOR = {"timeout": 504, "busy": 409, "not_found": 404, "config": 400, "validation": 400}
+_slots_lock = threading.Lock()
+_slots_used = 0
+_connections: set[str] = set()  # connection ids with an active read
+_status_lock = threading.Lock()  # status.json is rewritten by the read thread and by cancel
+
+STATUS_FOR = {"timeout": 504, "busy": 409, "not_found": 404, "config": 400, "validation": 400,
+              "not_ready": 409, "not_running": 409, "cancelled": 409}
 
 
 class SourceRequest(BaseModel):
@@ -50,6 +60,8 @@ class ReadRequest(SourceRequest):
     batch_size: int = Field(default=500, ge=1, le=10000)
     state: list[dict[str, Any]] | None = None
     key_fields: dict[str, list[str]] = {}
+    connection_id: str | None = None  # at most one active read per connection
+    wait: bool = True  # false: answer 202 at once and read in the background
 
 
 def _error(category: str, message: str, status: int | None = None) -> JSONResponse:
@@ -68,20 +80,43 @@ async def validation_error(_: Request, exc: RequestValidationError) -> JSONRespo
 def _payload(req: SourceRequest) -> dict[str, Any]:
     if req.connector not in ALLOWED_CONNECTORS:
         raise WorkerError("config", f"connector not supported: {req.connector}")
-    return req.model_dump()
+    return req.model_dump(exclude={"wait", "connection_id"})
 
 
-def _locked(fn):  # type: ignore[no-untyped-def]
+def _acquire(connection_id: str | None = None) -> JSONResponse | None:
+    """Take a slot (and the connection, if given). Returns a 409 busy response when that is not possible."""
+    global _slots_used
+    with _slots_lock:
+        if connection_id and connection_id in _connections:
+            return _error("busy", "a read for this connection is already running")
+        if _slots_used >= MAX_CONCURRENT_READS:
+            return _error("busy", f"worker is at its limit of {MAX_CONCURRENT_READS} concurrent operations")
+        _slots_used += 1
+        if connection_id:
+            _connections.add(connection_id)
+    return None
+
+
+def _release(connection_id: str | None = None) -> None:
+    global _slots_used
+    with _slots_lock:
+        _slots_used -= 1
+        if connection_id:
+            _connections.discard(connection_id)
+
+
+def _limited(fn):  # type: ignore[no-untyped-def]
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):  # type: ignore[no-untyped-def]
-        if not _busy.acquire(blocking=False):
-            return _error("busy", "another operation is running")
+        busy = _acquire()
+        if busy:
+            return busy
         try:
             return fn(*args, **kwargs)
         except WorkerError as e:
             return _error(e.category, e.message)
         finally:
-            _busy.release()
+            _release()
     return wrapper
 
 
@@ -107,12 +142,13 @@ def env() -> dict[str, Any]:
         "docker_cli": docker,
         "connector": {"name": DEFAULT_CONNECTOR, "image": f"airbyte/{DEFAULT_CONNECTOR}:{DEFAULT_VERSION}"},
         "read_timeout_seconds": READ_TIMEOUT_SECONDS,
+        "max_concurrent_reads": MAX_CONCURRENT_READS,
         "reads_kept": staging.KEEP_READS,
     }
 
 
 @app.post("/check")
-@_locked
+@_limited
 def check(req: SourceRequest) -> Any:
     try:
         run_isolated("check", _payload(req))
@@ -122,61 +158,141 @@ def check(req: SourceRequest) -> Any:
 
 
 @app.post("/discover")
-@_locked
+@_limited
 def discover(req: SourceRequest) -> Any:
     return run_isolated("discover", _payload(req))
 
 
-@app.post("/reads")
-@_locked
-def start_read(req: ReadRequest) -> Any:
-    payload = _payload(req)
-    read_id = staging.new_read_id()
-    d = staging.create(read_id)
-    started = datetime.now(timezone.utc).isoformat()
+def _update_status(d: Path, **fields: Any) -> None:
+    """Rewrite status.json; a cancelled read stays cancelled."""
+    with _status_lock:
+        status = staging.read_json(d / "status.json") or {}
+        if status.get("status") != "cancelled":
+            status |= fields
+            staging.write_json(d / "status.json", status)
+
+
+def _batches_ready(d: Path) -> int:
+    return (staging.read_json(d / "progress.json") or {}).get("batches_ready", 0)
+
+
+def _execute_read(read_id: str, d: Path, payload: dict[str, Any], connection_id: str | None) -> dict[str, Any]:
+    """Run the read, write the final status, give the slot back. Returns the result, or {'error': ...}."""
     t0 = time.monotonic()
-    status: dict[str, Any] = {"read_id": read_id, "status": "running", "started_at": started}
-    staging.write_json(d / "status.json", status)
-    log.info("read %s started: streams=%d mode=%s", read_id, len(req.streams), req.mode)
     try:
-        result = run_isolated("read", payload, work_dir=d)
+        result = run_isolated("read", payload, work_dir=d, job_id=read_id)
+        _update_status(d, status="completed", **result)
+        log.info("read %s completed: counts=%s batches=%s in %ss", read_id, result["counts"],
+                 result["batches"], result["duration_seconds"])
+        return result
     except WorkerError as e:
-        status |= {"status": "failed", "error": {"category": e.category, "message": e.message},
-                   "duration_seconds": round(time.monotonic() - t0, 2)}
-        staging.write_json(d / "status.json", status)
-        log.warning("read %s failed: %s", read_id, e.category)
-        resp = _error(e.category, e.message)
+        outcome = "cancelled" if e.category == "cancelled" else "failed"
+        fields: dict[str, Any] = {"status": outcome, "duration_seconds": round(time.monotonic() - t0, 2)}
+        if outcome == "failed":
+            fields["error"] = {"category": e.category, "message": e.message}
+        _update_status(d, **fields)
+        log.warning("read %s %s: category=%s batches=%s in %ss", read_id, outcome, e.category,
+                    _batches_ready(d), fields["duration_seconds"])
+        return {"error": {"category": e.category, "message": e.message}}
+    except Exception as e:  # noqa: BLE001 - never leave a read stuck in "running"
+        _update_status(d, status="failed", error={"category": "internal", "message": type(e).__name__},
+                       duration_seconds=round(time.monotonic() - t0, 2))
+        log.error("read %s failed: internal (%s)", read_id, type(e).__name__)
+        return {"error": {"category": "internal", "message": type(e).__name__}}
+    finally:
+        _release(connection_id)
+
+
+@app.post("/reads")
+def start_read(req: ReadRequest) -> Any:
+    try:
+        payload = _payload(req)
+    except WorkerError as e:
+        return _error(e.category, e.message)
+    busy = _acquire(req.connection_id)
+    if busy:
+        return busy
+    try:
+        read_id = staging.new_read_id()
+        d = staging.create(read_id)
+        staging.write_json(d / "status.json", {"read_id": read_id, "status": "running",
+                                               "started_at": datetime.now(timezone.utc).isoformat()})
+        log.info("read %s started: streams=%d mode=%s wait=%s", read_id, len(req.streams), req.mode, req.wait)
+        if not req.wait:
+            threading.Thread(target=_execute_read, args=(read_id, d, payload, req.connection_id),
+                             name=read_id, daemon=True).start()
+            return JSONResponse({"read_id": read_id, "status": "running"}, status_code=202)
+    except BaseException:
+        _release(req.connection_id)  # the read never started: give the slot back
+        raise
+    result = _execute_read(read_id, d, payload, req.connection_id)  # releases the slot itself
+    if "error" in result:
+        resp = _error(result["error"]["category"], result["error"]["message"])
         resp.headers["X-Read-Id"] = read_id
         return resp
-    status |= {"status": "completed", **result}
-    staging.write_json(d / "status.json", status)
-    log.info("read %s completed: counts=%s batches=%s in %ss", read_id, result["counts"],
-             result["batches"], result["duration_seconds"])
     return result
+
+
+def _status_of(read_id: str) -> dict[str, Any] | None:
+    return staging.read_json(staging.read_dir(read_id) / "status.json") if _valid_id(read_id) else None
 
 
 @app.get("/reads/{read_id}")
 def read_status(read_id: str) -> Any:
-    status = staging.read_json(staging.read_dir(read_id) / "status.json") if _valid_id(read_id) else None
-    return status if status else _error("not_found", f"unknown read: {read_id}")
+    status = _status_of(read_id)
+    if not status:
+        return _error("not_found", f"unknown read: {read_id}")
+    progress = staging.read_json(staging.read_dir(read_id) / "progress.json") or {}
+    return {**progress, **status}  # final values in status.json win
+
+
+@app.delete("/reads/{read_id}")
+def cancel_read(read_id: str) -> Any:
+    status = _status_of(read_id)
+    if not status:
+        return _error("not_found", f"unknown read: {read_id}")
+    if status.get("status") != "running":
+        return _error("not_running", f"read {read_id} is not running (status: {status.get('status')})")
+    d = staging.read_dir(read_id)
+    _update_status(d, status="cancelled")  # first, so the reader thread cannot overwrite it
+    cancel_job(read_id)
+    log.info("read %s cancelled by request, batches=%s", read_id, _batches_ready(d))
+    return read_status(read_id)
 
 
 @app.get("/reads/{read_id}/batches/{n}")
 def read_batch(read_id: str, n: int) -> Any:
-    batch = staging.read_json(staging.read_dir(read_id) / "batches" / f"{n}.json") if _valid_id(read_id) else None
-    return batch if batch else _error("not_found", f"no batch {n} for read {read_id}")
+    status = _status_of(read_id)  # read before the batch: a batch written in between just reads as "not ready"
+    batch = staging.read_json(staging.read_dir(read_id) / "batches" / f"{n}.json") if status else None
+    if batch:
+        return batch
+    if status and status.get("status") == "running":
+        return _error("not_ready", f"batch {n} of read {read_id} is not written yet")
+    return _error("not_found", f"no batch {n} for read {read_id}")
 
 
 @app.get("/reads/{read_id}/state")
 def read_state(read_id: str) -> Any:
-    d = staging.read_dir(read_id)
-    status = staging.read_json(d / "status.json") if _valid_id(read_id) else None
+    status = _status_of(read_id)
     if not status:
         return _error("not_found", f"unknown read: {read_id}")
     if status.get("status") != "completed":
         return _error("not_found", f"read {read_id} has no state (status: {status.get('status')})")
     # always false: only the caller knows when the data is committed, and saves the state after that
-    return {"read_id": read_id, "committed": False, "state": staging.read_json(d / "state.json") or []}
+    return {"read_id": read_id, "committed": False,
+            "state": staging.read_json(staging.read_dir(read_id) / "state.json") or []}
+
+
+@app.on_event("startup")
+def mark_orphaned_reads() -> None:
+    """A read left 'running' by a worker restart can never finish: say so."""
+    if not staging.READS_DIR.exists():
+        return
+    for d in staging.READS_DIR.iterdir():
+        status = staging.read_json(d / "status.json") if d.is_dir() else None
+        if status and status.get("status") == "running":
+            _update_status(d, status="failed",
+                           error={"category": "internal", "message": "worker restarted during the read"})
 
 
 def _valid_id(read_id: str) -> bool:

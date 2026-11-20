@@ -31,7 +31,13 @@ class JobError(Exception):
 
 def make_source(payload: dict[str, Any]) -> ab.Source:
     image = f"airbyte/{payload['connector']}:{payload['version']}"
-    return ab.get_source(payload["connector"], config=payload["config"], docker_image=image)
+    source = ab.get_source(payload["connector"], config=payload["config"], docker_image=image)
+    job_id = os.getenv("WORKER_JOB_ID")
+    if job_id:
+        # label this job's connector container so a timeout or cancel kills only this one
+        # (executable is ['docker', 'run', '--rm', ...])
+        source.executor.executable[2:2] = ["--label", f"airbyte-worker-job={job_id}"]
+    return source
 
 
 def op_check(payload: dict[str, Any]) -> dict[str, Any]:
@@ -137,12 +143,19 @@ def op_read(payload: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     batches = 0
     batch_size = int(payload.get("batch_size") or 500)
 
+    def progress() -> None:
+        staging.write_json(out_dir / "progress.json",
+                           {"counts": counts, "key_errors": key_errors, "batches_ready": batches})
+
     def flush() -> None:
         nonlocal batch, batches
         if batch:
             batches += 1
-            staging.write_batch(out_dir, read_id, batches, batch)
+            staging.write_batch(out_dir, read_id, batches, batch)  # file first, then the progress that names it
             batch = []
+            progress()
+
+    progress()
 
     try:
         lines = source.executor.execute(
@@ -181,6 +194,7 @@ def op_read(payload: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     if trace_error:
         raise JobError("connector", trace_error)
     flush()
+    progress()
 
     new_state = list(last_state.values())  # the connector's own STATE messages, passed through
     staging.write_json(out_dir / "state.json", new_state)

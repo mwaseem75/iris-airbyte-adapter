@@ -21,7 +21,7 @@ Identity of a record is connection + stream + key, so the same key in two tables
 
 | Path | What |
 |---|---|
-| `worker/` | Extraction worker: `/health`, `/env`, `/check`, `/discover`, `/reads`, `/reads/{id}`, `/reads/{id}/batches/{n}`, `/reads/{id}/state`; pytest tests |
+| `worker/` | Extraction worker: `/health`, `/env`, `/check`, `/discover`, `/reads`, `/reads/{id}`, `/reads/{id}/batches/{n}`, `/reads/{id}/state`, `DELETE /reads/{id}`; pytest tests |
 | `src/cls/Airbyte/Demo/` | IRIS production: service, operation, message, tables, helpers |
 | `iris/` | IRIS image setup |
 | `demo/` | Seed data and live-change scenarios |
@@ -76,7 +76,7 @@ Step-by-step walkthrough with expected results: [`DEMO.md`](DEMO.md). Design not
 ## Known limits (prototype)
 
 - One tested source: Postgres via `source-postgres`.
-- Reads run one at a time and synchronously; each read takes about 25 s because the Java connector starts.
+- The IRIS demo waits for each read to finish (about 25 s, because the Java connector starts). The worker can also run reads in the background (`wait=false`) with progress, batches available while reading, and cancel; the IRIS side does not use this yet.
 - Incremental reads need a cursor column (e.g. `updated_at`); Airbyte returns the boundary row again on each run, counted as unchanged.
 - Recovery beyond "state is saved only after commit" is not implemented yet.
 - Demo credentials only; not for production use.
