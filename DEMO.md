@@ -78,7 +78,7 @@ Open the Management Portal (login `_SYSTEM` / `SYS`):
 
 http://localhost:52773/csp/user/EnsPortal.ProductionConfig.zen?$NAMESPACE=USER
 
-`Airbyte.Demo.Production` has two items:
+`Airbyte.Demo.Production` has two items that run, and two that are switched off (`Extract2`, a second connection for showing parallel runs, and `ExtractBench`, used by the benchmark):
 
 | Item | Class | Role |
 |---|---|---|
@@ -93,7 +93,7 @@ Polling is switched off (`PollingEnabled = 0`), so runs start on demand with `Ru
 iris "##class(Airbyte.Demo.Service.Extract).RunNow()"
 ```
 
-A run takes about 30 seconds. Most of that is the Java connector starting in its own container; run `docker ps` in another terminal during a run to see it appear and go away.
+A run takes about 20 to 30 seconds. Most of that is the read process and the Java connector starting in its own container; run `docker ps` in another terminal during a run to see it appear and go away.
 
 Expected:
 
@@ -176,7 +176,7 @@ iris "##class(Airbyte.Demo.Util).Runs()"
 iris "##class(Airbyte.Demo.Util).State()"
 ```
 
-- `Runs()` lists every run with read / inserted / updated / unchanged / rejected counts.
+- `Runs()` lists every run with read / inserted / updated / unchanged / rejected counts, duration, store time and retries. `RunDetail(1)` shows the counts per stream and `Connections()` the last run and last success per connection.
 - `State()` shows the Airbyte source state IRIS stored: the `updated_at` position per incremental stream. IRIS sends it to the worker with each read, and saves the new one only after every batch has been committed. If a run fails, the state does not move and the next run reads the same records again; the unique key makes that safe.
 
 In the portal, open the Message Viewer and pick the latest session to see the Visual Trace: Extract sends one `Batch` message per stream to Store and gets the counts back.

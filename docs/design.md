@@ -61,7 +61,7 @@ IRIS does not know which connector it talks to. The Extract service has `Connect
 
 - **Batch messages.** Store has the setting `ClearBatchBodies` (default 1). After a batch is committed, the record data in the stored `Batch` message is emptied, so message storage keeps the headers and counts (Visual Trace still shows every message) but no second copy of the data. Set it to 0 to keep the data in the messages for debugging.
 - **Purge on a schedule.** Message headers and the Event Log still grow with every run. Schedule the standard purge task (`Ens.Util.Tasks.Purge`, System Management Portal > Task Manager) with `NumberOfDaysToKeep` 7, `KeepIntegrity` on and `BodiesToo` on, daily. Keep more days if you need a longer history.
-- **Worker.** After the state is saved, Extract calls `POST /reads/{id}/ack` and the worker deletes the batch files of that read. Each job's temp files (config with credentials, catalog, state) live in a folder of their own that is removed when the job ends, also after a timeout or a cancel; a startup sweep removes anything an earlier crash left. The connector's own log files do not contain the config or credentials (checked by searching `/data` and `/tmp` for the Postgres password after reads).
+- **Worker.** After each batch is committed, Extract calls `POST /reads/{id}/batches/{n}/ack` and the worker deletes that batch file; after the state is saved, `POST /reads/{id}/ack` deletes what is left. The batch files of a failed or cancelled read are deleted when the read ends. Each job's temp files (config with credentials, catalog, state) live in a folder of their own that is removed when the job ends, also after a timeout or a cancel; a startup sweep removes anything an earlier crash left. The connector's own log files do not contain the config or credentials (checked by searching `/data` and `/tmp` for the Postgres password after reads).
 
 ## Speed
 
@@ -103,8 +103,8 @@ IRIS does not know which connector it talks to. The Extract service has `Connect
 ## Known limits
 
 - One tested source: Postgres through `source-postgres`.
-- A run takes at least 20 s before the first record is stored: the worker starts a process for the read and the Java connector starts. After that records arrive quickly, and storing in IRIS (about 1,700 records/s for new records on the test machine) is slower than reading (about 7,700 records/s). Measurements: `bench/REPORT.md`.
-- The worker keeps all batch files of a read until the read is acknowledged, so the read folder grows with the size of the read (about 460 bytes of JSON per record; 441 MB for one million rows). Batch files of a cancelled or failed read stay until the worker removes old read folders (it keeps the last 10).
+- A run takes at least about 18 s before the first record is stored: the worker starts a process for the read and the Java connector starts. After that records arrive quickly, and storing in IRIS (about 1,700 records/s for new records on the test machine) is slower than reading (about 7,700 records/s). Measurements: `bench/REPORT.md`.
+- The worker reads faster than IRIS stores, so batch files wait for IRIS even though each is deleted once committed (about 460 bytes of JSON per record; a peak of about 400 MB for one million rows). Slowing the worker down (backpressure) is not built.
 - A wrong host or a stopped source is reported by the connector as a generic connector error, so it is retried like a temporary error before the run fails.
 - Timestamps from `timestamptz` columns come back in UTC (same instant, original offset not kept).
 - Recovery beyond "state is saved only after commit" is not implemented yet.
