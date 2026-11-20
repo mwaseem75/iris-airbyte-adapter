@@ -37,7 +37,7 @@ git clone https://github.com/mwaseem75/iris-airbyte-adapter.git
 cd iris-airbyte-adapter
 cp .env.example .env                          # then set POSTGRES_PASSWORD in .env
 docker pull airbyte/source-postgres:3.8.11    # the connector image (otherwise the first run downloads it)
-docker compose up -d --build --wait           # IRIS, Postgres with demo data, worker
+docker compose up -d --build --wait           # IRIS, Postgres with demo data, worker (about 5 minutes the first time)
 ```
 
 First run, in the IRIS container (`docker exec -it iris iris session IRIS -U USER`):
