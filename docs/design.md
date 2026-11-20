@@ -21,7 +21,8 @@ Extraction runs outside IRIS on purpose: connectors bring their own runtimes (Ja
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/health`, `/env` | Liveness; versions |
-| POST | `/check` | Validate config and connection |
+| POST | `/spec` | The connector's settings as JSON Schema (`connection_specification`) and `secret_fields` (dotted paths of every `airbyte_secret` property, also inside `oneOf` options). Cached per image in memory and under `/data/specs/` |
+| POST | `/check` | Validate config and connection. A config that does not fit the spec is `400 config` with `details: [{path, reason}]` (no values) |
 | POST | `/discover` | Streams, schemas, primary keys, sync modes |
 | POST | `/reads` | Start a read; body carries config, streams, mode, batch size, input state, optional `connection_id` and `wait` (default `true`). `wait=true`: returns the full result when done. `wait=false`: returns `202 {read_id, status: "running"}` at once |
 | GET | `/reads/{id}` | Status (`running`, `completed`, `failed`, `cancelled`) with progress: records so far per stream, key errors, `batches_ready`. Final counts, batches, sync modes and duration when completed; `error {category, message}` when failed |
@@ -34,6 +35,10 @@ Record format:
 ```json
 {"stream": "customers", "key": ["1"], "data": {"id": 1, "name": "Alice Smith", "balance": "120.50", "updated_at": "2026-11-01T10:00:00+00:00", "email": "alice@example.com"}}
 ```
+
+## Connector settings
+
+IRIS does not know which connector it talks to. The Extract service has `ConnectorName`, `ConnectorVersion`, `ConnectorConfig` (the connector's own settings as JSON, without secrets) and `CredentialFields` (`config.path=CredentialsProperty` pairs, dotted paths for nested fields). At run time `BuildConfig` puts the values from the IRIS Credentials entry into the config at those paths. The worker validates the config against the connector's spec before check, discover and read, and hides the spec's secret fields in error messages. `Util.Spec()`, `Util.Check()` and `Util.Discover()` show the spec, validate the connection and list the streams from the IRIS terminal.
 
 ## Rules the code follows
 

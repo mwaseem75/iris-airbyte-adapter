@@ -42,6 +42,9 @@ Then, in the IRIS container (`docker exec -it iris iris session IRIS -U USER`):
 
 ```objectscript
 do ##class(Airbyte.Demo.Util).Status()              // production running, credentials present
+do ##class(Airbyte.Demo.Util).Spec()                // the connector's settings, required and secret fields
+do ##class(Airbyte.Demo.Util).Check()               // validate the connection
+do ##class(Airbyte.Demo.Util).Discover()            // streams, keys, cursors, sync modes
 do ##class(Airbyte.Demo.Service.Extract).RunNow()   // first run: 13 read, 13 inserted
 do ##class(Airbyte.Demo.Util).Records()             // rows per stream
 do ##class(Airbyte.Demo.Service.Extract).RunNow()   // rerun: 7 read, 7 unchanged, no duplicates
@@ -75,7 +78,7 @@ Step-by-step walkthrough with expected results: [`DEMO.md`](DEMO.md). Design not
 
 ## Known limits (prototype)
 
-- One tested source: Postgres via `source-postgres`.
+- One tested source: Postgres via `source-postgres`. The IRIS side is connector-neutral (settings `ConnectorName`, `ConnectorVersion`, `ConnectorConfig` as JSON, `CredentialFields`), but the worker only runs connectors listed in `ALLOWED_CONNECTORS` (default `source-postgres`).
 - The IRIS demo waits for each read to finish (about 25 s, because the Java connector starts). The worker can also run reads in the background (`wait=false`) with progress, batches available while reading, and cancel; the IRIS side does not use this yet.
 - Incremental reads need a cursor column (e.g. `updated_at`); Airbyte returns the boundary row again on each run, counted as unchanged.
 - Recovery beyond "state is saved only after commit" is not implemented yet.

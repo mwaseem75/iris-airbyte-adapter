@@ -33,6 +33,128 @@ ClassMethod Key(pKey As %String = "[""1""]")
     }
 }
 
+/// The Extract service with the settings of the running production
+ClassMethod Service(Output pService As Airbyte.Demo.Service.Extract) As %Status [ Private ]
+{
+    Quit ##class(Ens.Director).CreateBusinessService("Extract", .pService)
+}
+
+/// The connector's settings: required fields, optional fields, and which ones are secret
+/// (secrets belong in the Credentials entry, see the CredentialFields setting)
+ClassMethod Spec()
+{
+    Set tSC = ..Service(.tSvc)
+    If $$$ISERR(tSC) {
+        Do $System.Status.DisplayError(tSC)
+        Quit
+    }
+    Try {
+        Set tSpec = tSvc.Spec()
+    } Catch ex {
+        Write !,"spec failed: ",ex.AsStatus(),!
+        Quit
+    }
+    Set tSchema = tSpec.%Get("connection_specification")
+    Set tSecret = ""
+    Set tIt = tSpec.%Get("secret_fields").%GetIterator()
+    While tIt.%GetNext(.tI, .tPath) {
+        Set tSecret(tPath) = 1
+    }
+    Write !,tSpec.%Get("connector")," ",tSpec.%Get("version"),!
+    Set tReq = ""
+    Set tIt = tSchema.%Get("required").%GetIterator()
+    While tIt.%GetNext(.tI, .tName) {
+        Set tReq(tName) = 1
+    }
+    Write !,"required:",!
+    Set tIt = tSchema.%Get("properties").%GetIterator()
+    While tIt.%GetNext(.tName, .tProp) {
+        If $Data(tReq(tName)) {
+            Write "  ",tName,?42,..TypeOf(tProp),$Select($Data(tSecret(tName)):"  SECRET", 1:""),!
+        }
+    }
+    Write !,"optional:",!
+    Set tIt = tSchema.%Get("properties").%GetIterator()
+    While tIt.%GetNext(.tName, .tProp) {
+        If '$Data(tReq(tName)) {
+            Write "  ",tName,?42,..TypeOf(tProp),$Select($Data(tSecret(tName)):"  SECRET", 1:""),!
+        }
+    }
+    Write !,"secret fields (set them through Credentials and CredentialFields, not in ConnectorConfig):",!
+    Set tPath = ""
+    For {
+        Set tPath = $Order(tSecret(tPath))
+        Quit:tPath=""
+        Write "  ",tPath,!
+    }
+}
+
+ClassMethod TypeOf(pProp As %DynamicObject) As %String [ Private ]
+{
+    Set tType = pProp.%Get("type")
+    If $IsObject(tType) {
+        Set tType = tType.%ToJSON()
+    }
+    If (tType = "") && pProp.%IsDefined("oneOf") {
+        Set tType = "one of several options"
+    }
+    Quit tType
+}
+
+/// Validate the connection with the settings of the running production
+ClassMethod Check()
+{
+    Set tSC = ..Service(.tSvc)
+    If $$$ISERR(tSC) {
+        Do $System.Status.DisplayError(tSC)
+        Quit
+    }
+    Try {
+        Set tResp = tSvc.PostJSON("/check", tSvc.SourceBody(), .tCode)
+    } Catch ex {
+        Write !,"check failed: ",ex.AsStatus(),!
+        Quit
+    }
+    If (tCode = 200) && tResp.%Get("ok") {
+        Write !,"check: ok",!
+        Quit
+    }
+    Set tErr = $Select(tCode = 200:tResp.%Get("error"), 1:tResp.%Get("error"))
+    Write !,"check failed (HTTP ",tCode,"): ",tErr.%Get("category")," - ",tErr.%Get("message"),!
+    If tErr.%IsDefined("details") {
+        Set tIt = tErr.%Get("details").%GetIterator()
+        While tIt.%GetNext(.tI, .tD) {
+            Write "  ",tD.%Get("path"),": ",tD.%Get("reason"),!
+        }
+    }
+}
+
+/// List the streams of the source: primary key, cursor, sync modes
+ClassMethod Discover()
+{
+    Set tSC = ..Service(.tSvc)
+    If $$$ISERR(tSC) {
+        Do $System.Status.DisplayError(tSC)
+        Quit
+    }
+    Try {
+        Set tResp = tSvc.PostJSON("/discover", tSvc.SourceBody(), .tCode)
+    } Catch ex {
+        Write !,"discover failed: ",ex.AsStatus(),!
+        Quit
+    }
+    If tCode '= 200 {
+        Set tErr = tResp.%Get("error")
+        Write !,"discover failed (HTTP ",tCode,"): ",tErr.%Get("category")," - ",tErr.%Get("message"),!
+        Quit
+    }
+    Write !,"stream",?20,"primary key",?46,"cursor",?60,"sync modes",!
+    Set tIt = tResp.%Get("streams").%GetIterator()
+    While tIt.%GetNext(.tI, .tS) {
+        Write tS.%Get("name"),?20,tS.%Get("primary_key").%ToJSON(),?46,tS.%Get("default_cursor_field").%ToJSON(),?60,tS.%Get("supported_sync_modes").%ToJSON(),!
+    }
+}
+
 /// The runs and their counters
 ClassMethod Runs()
 {

@@ -40,6 +40,11 @@ def make_source(payload: dict[str, Any]) -> ab.Source:
     return source
 
 
+def op_spec(payload: dict[str, Any]) -> dict[str, Any]:
+    """The connector's settings as JSON Schema. Needs no config."""
+    return {"connection_specification": make_source({**payload, "config": {}}).config_spec}
+
+
 def op_check(payload: dict[str, Any]) -> dict[str, Any]:
     make_source(payload).check()
     return {"ok": True}

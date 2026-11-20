@@ -23,7 +23,11 @@ XData ProductionDefinition
     <Setting Target="Host" Name="Mode">incremental</Setting>
     <Setting Target="Host" Name="BatchSize">500</Setting>
     <Setting Target="Host" Name="ReadTimeout">120</Setting>
+    <Setting Target="Host" Name="ConnectorName">source-postgres</Setting>
+    <Setting Target="Host" Name="ConnectorVersion">3.8.11</Setting>
+    <Setting Target="Host" Name="ConnectorConfig">{"host":"host.docker.internal","port":5433,"database":"demo","schemas":["public"],"ssl_mode":{"mode":"disable"},"replication_method":{"method":"Standard"},"tunnel_method":{"tunnel_method":"NO_TUNNEL"}}</Setting>
     <Setting Target="Host" Name="Credentials">Postgres</Setting>
+    <Setting Target="Host" Name="CredentialFields">username=Username,password=Password</Setting>
     <Setting Target="Host" Name="Target">Store</Setting>
   </Item>
 </Production>

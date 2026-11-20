@@ -188,6 +188,7 @@ http://localhost:52773/csp/user/EnsPortal.MessageViewer.zen?$NAMESPACE=USER
 The worker has its own API docs at http://localhost:8000/docs.
 
 - `GET /env` shows the versions in use.
+- `POST /spec` returns the connector's settings as JSON Schema and the list of secret fields.
 - `POST /discover` lists streams, keys and sync modes. Try it from the docs page with this body (use the password from your `.env`):
 
 ```json
@@ -247,6 +248,6 @@ Or remove everything, including volumes: `docker compose down -v`.
 | `Status()` shows `STOPPED` | `iris "##class(Airbyte.Demo.Production).Setup()"`, or press Start on the Production page |
 | A run says `timeout` | The read took longer than 120 s and was stopped; the state was not saved. Run it again. If it repeats: `docker compose restart worker` |
 | `Skipped ... worker is busy (409)` or `another run is active` | A previous run is still going. Wait 30 seconds and try again |
-| The connector cannot reach Postgres | Check `docker compose ps`. The connector uses `host.docker.internal:5433`; change `POSTGRES_HOST_PORT` in `.env` if 5433 is taken (and the `SourcePort` setting of Extract) |
+| The connector cannot reach Postgres | Check `docker compose ps`. The connector uses `host.docker.internal:5433`; change `POSTGRES_HOST_PORT` in `.env` if 5433 is taken (and the `port` in the `ConnectorConfig` setting of Extract) |
 | Counts differ from this page | A step was already run. Use "Start again" and continue from step 4 |
 | The first run is slow | The first run after a start takes longer (about 45 s) |

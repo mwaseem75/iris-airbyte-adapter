@@ -19,12 +19,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from app import staging
+from app import spec as specs, staging
 from app.isolation import READ_TIMEOUT_SECONDS, WorkerError, cancel as cancel_job, run_isolated
 
 DEFAULT_CONNECTOR = "source-postgres"
 DEFAULT_VERSION = "3.8.11"
-ALLOWED_CONNECTORS = {DEFAULT_CONNECTOR}  # only connectors that have been tested
+ALLOWED_CONNECTORS = {c.strip() for c in os.getenv("ALLOWED_CONNECTORS", DEFAULT_CONNECTOR).split(",") if c.strip()}  # only tested connectors
 
 # limit for all connector operations together: reads, check and discover
 MAX_CONCURRENT_READS = max(1, int(os.getenv("MAX_CONCURRENT_READS", "2")))
@@ -48,6 +48,11 @@ class SourceRequest(BaseModel):
     config: dict[str, Any]
 
 
+class SpecRequest(BaseModel):
+    connector: str = DEFAULT_CONNECTOR
+    version: str = DEFAULT_VERSION
+
+
 class StreamSpec(BaseModel):
     name: str
     mode: Literal["full_refresh", "incremental"] | None = None
@@ -64,9 +69,24 @@ class ReadRequest(SourceRequest):
     wait: bool = True  # false: answer 202 at once and read in the background
 
 
-def _error(category: str, message: str, status: int | None = None) -> JSONResponse:
-    return JSONResponse({"error": {"category": category, "message": message}},
-                        status_code=status or STATUS_FOR.get(category, 502))
+class ConfigProblems(WorkerError):
+    """Config does not match the connector's spec. details: [{path, reason}], never values."""
+
+    def __init__(self, details: list[dict[str, str]]) -> None:
+        super().__init__("config", "config does not match the connector spec")
+        self.details = details
+
+
+def _error(category: str, message: str, status: int | None = None,
+           details: list[dict[str, str]] | None = None) -> JSONResponse:
+    body: dict[str, Any] = {"category": category, "message": message}
+    if details:
+        body["details"] = details
+    return JSONResponse({"error": body}, status_code=status or STATUS_FOR.get(category, 502))
+
+
+def _worker_error(e: WorkerError) -> JSONResponse:
+    return _error(e.category, e.message, details=getattr(e, "details", None))
 
 
 @app.exception_handler(RequestValidationError)
@@ -81,6 +101,31 @@ def _payload(req: SourceRequest) -> dict[str, Any]:
     if req.connector not in ALLOWED_CONNECTORS:
         raise WorkerError("config", f"connector not supported: {req.connector}")
     return req.model_dump(exclude={"wait", "connection_id"})
+
+
+def _spec(req: SourceRequest) -> dict[str, Any] | None:
+    """The connector's spec (cached per image). None if it cannot be fetched."""
+    try:
+        return specs.get_spec(req.connector, req.version,
+                              lambda: run_isolated("spec", {"connector": req.connector, "version": req.version}))
+    except (WorkerError, ValueError) as e:
+        log.warning("spec for %s:%s not available: %s", req.connector, req.version, type(e).__name__)
+        return None
+
+
+def _prepare(req: SourceRequest) -> dict[str, Any]:
+    """Payload for the child process. Raises ConfigProblems if the config does not fit the spec.
+    Call with a slot held (fetching the spec runs the connector once per image)."""
+    payload = _payload(req)
+    spec = _spec(req)
+    if spec:
+        found = specs.problems(req.config, spec["connection_specification"])
+        if found:
+            log.warning("config rejected for %s: %d problem(s) at %s", req.connector, len(found),
+                        [p["path"] for p in found])
+            raise ConfigProblems(found)
+        payload["secret_fields"] = spec["secret_fields"]
+    return payload
 
 
 def _acquire(connection_id: str | None = None) -> JSONResponse | None:
@@ -114,7 +159,7 @@ def _limited(fn):  # type: ignore[no-untyped-def]
         try:
             return fn(*args, **kwargs)
         except WorkerError as e:
-            return _error(e.category, e.message)
+            return _worker_error(e)
         finally:
             _release()
     return wrapper
@@ -147,11 +192,22 @@ def env() -> dict[str, Any]:
     }
 
 
+@app.post("/spec")
+@_limited
+def spec(req: SpecRequest) -> Any:
+    _payload(req)  # connector must be allowed
+    found = _spec(req)
+    if not found:
+        raise WorkerError("connector", "could not read the connector spec")
+    return found
+
+
 @app.post("/check")
 @_limited
 def check(req: SourceRequest) -> Any:
+    payload = _prepare(req)  # a config that does not fit the spec is a 400, not an {ok: false}
     try:
-        run_isolated("check", _payload(req))
+        run_isolated("check", payload)
         return {"ok": True}
     except WorkerError as e:
         return {"ok": False, "error": {"category": e.category, "message": e.message}}
@@ -160,7 +216,7 @@ def check(req: SourceRequest) -> Any:
 @app.post("/discover")
 @_limited
 def discover(req: SourceRequest) -> Any:
-    return run_isolated("discover", _payload(req))
+    return run_isolated("discover", _prepare(req))
 
 
 def _update_status(d: Path, **fields: Any) -> None:
@@ -206,13 +262,14 @@ def _execute_read(read_id: str, d: Path, payload: dict[str, Any], connection_id:
 @app.post("/reads")
 def start_read(req: ReadRequest) -> Any:
     try:
-        payload = _payload(req)
+        _payload(req)  # connector allowed? (cheap, before taking a slot)
     except WorkerError as e:
-        return _error(e.category, e.message)
+        return _worker_error(e)
     busy = _acquire(req.connection_id)
     if busy:
         return busy
     try:
+        payload = _prepare(req)
         read_id = staging.new_read_id()
         d = staging.create(read_id)
         staging.write_json(d / "status.json", {"read_id": read_id, "status": "running",
@@ -222,6 +279,9 @@ def start_read(req: ReadRequest) -> Any:
             threading.Thread(target=_execute_read, args=(read_id, d, payload, req.connection_id),
                              name=read_id, daemon=True).start()
             return JSONResponse({"read_id": read_id, "status": "running"}, status_code=202)
+    except WorkerError as e:  # config problems: the read never started
+        _release(req.connection_id)
+        return _worker_error(e)
     except BaseException:
         _release(req.connection_id)  # the read never started: give the slot back
         raise

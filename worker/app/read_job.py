@@ -26,11 +26,26 @@ def short(message: str) -> str:
     return m.group(1) if m else message
 
 
-def scrub(message: str, config: dict) -> str:
+def values_at(config: Any, path: str) -> list[str]:
+    """String values at a dotted path (lists are walked through)."""
+    nodes = [config]
+    for part in path.split("."):
+        nodes = [c for n in nodes for c in (n if isinstance(n, list) else [n])]
+        nodes = [n[part] for n in nodes if isinstance(n, dict) and part in n]
+    return [v for n in nodes for v in (n if isinstance(n, list) else [n]) if isinstance(v, str) and v]
+
+
+def scrub(message: str, config: dict, secret_fields: list[str] | None = None) -> str:
+    """Hide secrets in an error message. The spec's secret fields are exact; without a spec,
+    guess from the key names."""
     message = short(message)
-    for key, value in config.items():
-        if isinstance(value, str) and value and any(w in key for w in ("password", "secret", "token", "key")):
-            message = message.replace(value, "***")
+    if secret_fields:
+        secrets = [v for path in secret_fields for v in values_at(config, path)]
+    else:
+        secrets = [v for k, v in config.items()
+                   if isinstance(v, str) and v and any(w in k for w in ("password", "secret", "token", "key"))]
+    for value in sorted(set(secrets), key=len, reverse=True):
+        message = message.replace(value, "***")
     return message[:500]
 
 
@@ -38,8 +53,11 @@ def main() -> None:
     op, work = sys.argv[1], Path(sys.argv[2])
     payload = json.loads(sys.stdin.read())
     config = payload.get("config", {})
+    secrets = payload.get("secret_fields")
     try:
-        if op == "check":
+        if op == "spec":
+            result = runner.op_spec(payload)
+        elif op == "check":
             result = runner.op_check(payload)
         elif op == "discover":
             result = runner.op_discover(payload)
@@ -49,11 +67,11 @@ def main() -> None:
     except runner.JobError as e:
         category = e.category if e.category != "connector" else classify(e.message)
         staging.write_json(work / "result.json",
-                           {"ok": False, "category": category, "message": scrub(e.message, config)})
+                           {"ok": False, "category": category, "message": scrub(e.message, config, secrets)})
     except Exception as e:  # noqa: BLE001
         text = str(e)
         staging.write_json(work / "result.json",
-                           {"ok": False, "category": classify(text), "message": scrub(text, config)})
+                           {"ok": False, "category": classify(text), "message": scrub(text, config, secrets)})
 
 
 if __name__ == "__main__":

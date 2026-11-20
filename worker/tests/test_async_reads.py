@@ -48,6 +48,7 @@ def api(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "_slots_used", 0)
     monkeypatch.setattr(main, "_connections", set())
     fake = FakeRead()
+    monkeypatch.setattr(main, "_spec", lambda req: None)  # no spec: validation is tested in test_spec.py
     monkeypatch.setattr(main, "run_isolated", fake.run)
     monkeypatch.setattr(main, "cancel_job", fake.cancel)
     client = TestClient(main.app)
