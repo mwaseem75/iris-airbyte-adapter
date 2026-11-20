@@ -4,15 +4,73 @@ First measurements of the adapter on one machine: Postgres, the PyAirbyte worker
 
 ## Findings
 
-- **IRIS is the slow part on large loads.** One million rows took 12 minutes (722 s). The worker had read all of them after 130 s (about 7,700 records/s); IRIS needed 588 s to store them (about 1,700 records/s). The worker works ahead of IRIS, so total time follows the store time.
-- **Every run has a fixed cost of about 20 to 25 seconds**, however small the read is. A rerun that reads one record took 26 s; 10,000 records took 19 s; a mixed run with 10,000 records took 30 to 36 s. Starting the read process and the connector container and discovering the schema is not broken down further here. Polling more often than once a minute does not make sense.
-- **Throughput on 100,000 rows is 1,100 to 2,000 records/s and varies a lot from run to run.** The same initial load took 51 s and 74 s, and the setup loads of other scenarios took 88 to 105 s. The machine is a laptop whose CPU is shared by all four components, so single numbers have a wide margin.
-- **Updating and re-reading is cheap compared with inserting.** A full re-read of 100,000 unchanged records was stored in 17 s (about 5,800 records/s, compared by hash) against 23 to 56 s for the first load.
-- **The batch size makes no clear difference between 500 and 5,000**, inside that variation (83 s, 51 to 105 s, 88 s and 74 s for 500, 1,000, 2,000 and 5,000).
-- **Recovery works.** A load of 100,000 rows was cancelled after 50 batches had been read (IRIS had stored 20,000 rows by then). The rerun stored 80,000 new rows and found 20,000 unchanged. IRIS held exactly 100,000 rows afterwards, no duplicates.
-- **Ten mixed runs in a row stayed flat** (30 to 36 s each, store time 2.7 to 4.8 s, no growth). A run with an incremental cursor reads the rows changed since the last run plus the rows that share the newest cursor value, so each of runs 2 to 10 read 5,000 changed and 5,000 unchanged records.
-- **Memory:** for one million rows the connector container peaked at 1.8 GB, IRIS at 1.1 GB, Postgres at 0.4 GB and the worker at 0.4 GB. The worker keeps every batch file of a read until IRIS acknowledges the read, so its read folder grew to 441 MB for one million rows (about 460 bytes of JSON per record).
-- **CPU:** the connector alone used 265 to 475 % of a core (100 % = one core), the worker up to 200 % and IRIS 110 to 140 %. On a machine with few cores they compete with each other and with the store.
+The first measurements (section "Results per scenario") showed that storing in IRIS was the slow part and that every run had a fixed cost of 20 to 25 s. This version of the report adds what was found and changed after that.
+
+- **Where the store time went.** For 100,000 new records, IRIS spent 49 % of the store time writing the records, 24 % computing the hash, 15 % looking up whether the record exists, and only 0.1 % on the commit. Counting, parsing and the transaction are not the problem.
+- **Two changes in Store made it a quarter to a third faster.** The worker now sends the hash of each record, so IRIS only compares it (the hash step went from 11.3 s to 0.3 s), and the lookup goes through the index without opening the record (7.0 s to 3.5 s). The store time for 100,000 new records fell from 47.9 s to 31.7 s in the profile run, and from a median of 40.9 s to 31.9 s in the repeated runs.
+- **One million rows now take 7.6 minutes (455 s), down from 12 minutes (722 s).** Storing is still the longest part (317 s of 455 s). Writing the records is now 70 % of the store time; a plain SQL `INSERT` costs the same per record (about 220 microseconds), so this part was not changed.
+- **The fixed cost per run went from 24 to 18 s** (median of the unchanged-data scenario). The read started the connector twice: once to discover the streams and once to read. The discovery is now cached, which saves 6 to 7 s per run. Starting the read process and importing PyAirbyte takes another 6 to 9 s and is the largest part left.
+- **Batch files are deleted as soon as IRIS has committed them.** The worker folder still grew to 394 MB for one million rows, because the worker reads about twice as fast as IRIS stores and the files wait for IRIS. Only slowing the worker down would shrink that.
+- **Recovery, resource use and the rest are unchanged** from the first measurements below.
+
+## Before and after
+
+Median of three runs (minimum to maximum) for the first four scenarios, one run for one million rows. "Before" is the code of the first measurements; its rows are kept in `bench/results/results.csv` with `version=before`, the new ones are `version=after`. The "before" values of `initial_100k` are the two first runs plus a third one taken just before the change.
+
+**Total seconds** - median (min-max)
+
+| Scenario | Before | After | Change of the median |
+|---|--:|--:|--:|
+| initial_10k | 32.5 (19.1-35.0), n=3 | 24.6 (22.2-28.8), n=3 | -24 % |
+| initial_100k | 74.4 (50.9-97.0), n=3 | 63.7 (61.5-64.3), n=3 | -14 % |
+| mixed_100k | 35.0 (34.1-35.0), n=3 | 24.8 (24.3-25.0), n=3 | -29 % |
+| unchanged_100k | 26.2 (24.1-30.2), n=3 | 18.2 (18.2-24.1), n=3 | -31 % |
+| initial_1m | 722.1, n=1 | 454.8, n=1 | -37 % |
+
+**Store seconds** - median (min-max)
+
+| Scenario | Before | After | Change of the median |
+|---|--:|--:|--:|
+| initial_10k | 5.4 (2.5-5.8), n=3 | 3.6 (3.4-3.7), n=3 | -33 % |
+| initial_100k | 40.9 (23.5-57.1), n=3 | 31.9 (31.1-33.1), n=3 | -22 % |
+| mixed_100k | 7.6 (7.1-8.0), n=3 | 5.5 (5.1-5.7), n=3 | -27 % |
+| unchanged_100k | 0.0 (0.0-0.0), n=3 | 0.0 (0.0-0.0), n=3 | - |
+| initial_1m | 588.2, n=1 | 316.6, n=1 | -46 % |
+
+Throughput of the 100,000-row load: 1,030 to 1,960 records/s before, 1,550 to 1,625 after. One million rows: 1,385 records/s before, 2,199 after.
+
+The numbers still vary between runs on this laptop: the same scenario ranged from 51 to 97 s before. The "after" runs were taken one after the other in one session, so their spread (62 to 64 s) is probably narrower than it would be over a day. Read the change as "about a quarter to a third faster", not as exact percentages.
+
+## Where the store time goes
+
+Seconds spent in the Store operation while loading 100,000 new records (`initial_100k`, measured with the debug timing switch described in `docs/design.md`; the timing itself adds a little).
+
+| Phase | Before s | Before % | After s | After % |
+|---|--:|--:|--:|--:|
+| Parse the batch JSON | 0.85 | 1.8 | 0.80 | 2.5 |
+| Serialize the record data | 1.35 | 2.8 | 1.46 | 4.6 |
+| Hash | 11.31 | 23.6 | 0.26 | 0.8 |
+| Look up the key | 7.05 | 14.7 | 3.46 | 10.9 |
+| Write the new record | 23.34 | 48.8 | 22.01 | 69.5 |
+| Update the run counters, commit | 0.06 | 0.1 | 0.06 | 0.2 |
+| Not measured (loop and call overhead) | 3.91 | 8.2 | 3.62 | 11.4 |
+| **Total in Store** | **47.87** | | **31.67** | |
+
+The remaining cost is writing the record: creating the record and its data stream and updating the unique index. A test that inserted 5,000 records with SQL instead of objects took the same time per record, so there is no cheaper way inside the current table design. Splitting a batch over several store jobs, or a different table layout, would be the next step.
+
+## Fixed cost of a run
+
+A rerun that reads one record, worker side, in seconds:
+
+| Phase | Before | After |
+|---|--:|--:|
+| Start the read process and import PyAirbyte | 6.2 | 6 to 9 |
+| Start the connector to discover the streams | 6.0 to 6.6 | 0 (cached) |
+| Start the connector for the read, until its first message | 2.8 | 3.0 |
+| The connector reads and stops | 5.0 | 4.6 |
+| **Worker total** | **21.0 to 21.6** | **14.8** |
+
+IRIS adds a few seconds on top (the start request, polling every 2 s, fetching the state, the acknowledgement), so the whole run takes 24 to 30 s before and 18 to 24 s after. The discovery is reused for one hour by default (`CATALOG_CACHE_TTL_SECONDS`). A column that is added in the source shows up after that time or after a call to `/discover`. The next candidates are the process start (a worker process that has imported PyAirbyte already and starts a read without the import) and the connector's own start, which the worker cannot influence.
 
 ## Environment
 
@@ -31,7 +89,7 @@ The full list is in `bench/results/environment.json`.
 
 The test table `bench_items` has an id, name, email, amount, status, a 100-character note, a small nested JSON object and `updated_at`. A record is about 460 bytes of JSON in a batch (the batch also carries the key).
 
-## Results per scenario
+## Results per scenario (first measurement, before the changes)
 
 "Total" is the run time recorded by IRIS (`Run.DurationSeconds`). "Worker" is the time the worker spent on the read, from the start request until the read finished, including starting the connector. "Store" is the time the Store operation spent writing batches in IRIS (`Run.StoreSeconds`). Worker and store time overlap, because IRIS stores batches while the worker is still reading, so they do not add up to the total. MB/s counts the batch JSON the worker produced. The scenario `initial_100k` was run twice; both rows are listed. In `recovery_100k_interrupted` the worker has no duration because the read was cancelled.
 
@@ -86,19 +144,20 @@ Highest values seen while the run was active, sampled with `docker stats` (one p
 | sustained_100k_01 | 282 | 427 | 78 | 325 | 190 | 110 | 11 | 271 | 25.6 |
 | sustained_100k_10 | 275 | 428 | 78 | 322 | 113 | 104 | 11 | 311 | 4.7 |
 
-## Where the time goes
+## Where the time goes now
 
-- **Large initial load:** the store step. At one million rows it is 588 s of 722 s. Worker and Postgres are not the limit; both are idle for most of the run.
-- **Small incremental run:** the fixed cost of starting a read (20 to 25 s). The records themselves take only 3 to 5 seconds to store.
-- **Unchanged data:** reading is the main cost; storing compares hashes and writes nothing.
+- **Large initial load:** still the store step (317 s of 455 s for one million rows), mostly writing the records.
+- **Small incremental run:** the fixed cost of a read (about 15 s in the worker, 18 s in total). Storing the records takes 3 to 5 s.
+- **Unchanged data:** reading is the main cost. Storing compares hashes without opening the records.
 
 ## Recommended settings
 
 - **`BatchSize`:** 1,000 to 5,000. The tests show no difference worth tuning for; 1,000 keeps each transaction and each HTTP call small.
-- **`CallInterval` (how often the service polls):** 60 seconds or more for incremental loads, because a run never takes less than about 20 s.
+- **`CallInterval` (how often the service polls):** 30 seconds or more for incremental loads, because a run now takes at least about 18 s.
 - **Worker `READ_TIMEOUT_SECONDS`:** 1800 or more for reads of a million rows or more. The worker part of one million rows took 130 s here, but a slower source or network will take longer. The default of 120 is only enough for small reads.
 - **`ReadTimeout` of the Extract service:** 3600 for large loads (one million rows took 12 minutes here).
 - **Docker resources:** at least 4 CPUs and 6 GB of memory for loads of about a million rows (the containers together peaked at about 3.7 GB of the 4.8 GB that were available); 8 GB gives room.
+- **`CATALOG_CACHE_TTL_SECONDS`:** the default of 3600 is fine. Lower it if the source tables change often; 0 turns the cache off.
 - **Purge:** schedule the standard message purge. A large load creates one message per batch.
 
 ## Limits of this test
@@ -107,6 +166,7 @@ Highest values seen while the run was active, sampled with `docker stats` (one p
 - Everything shares one laptop CPU. On separate hosts the store and the extraction would not compete.
 - No network latency: Postgres runs next to the worker. AWS RDS results will follow with the same scripts.
 - The memory and CPU figures are samples about a second apart; short peaks can be missed. CPU above 100 % means more than one core.
+- The "before" and "after" runs were taken at different times on a shared laptop; "before" has three runs per scenario and one for one million rows, so differences under about 15 % are not meaningful.
 - The staging figure also counts files left by earlier cancelled reads (the worker keeps the last 10 read folders).
 - Only `source-postgres` with the table described above was measured: no wide rows, no large text or binary columns.
 - The scenario `unchanged_100k` uses the incremental cursor, so it reads a single record. `unchanged_100k_full_refresh` reads all 100,000.
@@ -121,4 +181,4 @@ bench/run.sh initial_100k        # one scenario (PowerShell: bench\run.ps1 initi
 bench/run.sh environment         # rewrite results/environment.json
 ```
 
-Each run adds a row to `bench/results/results.csv`; the connection `bench` and the table `bench_items` are the only things changed. Scenarios: `initial_10k`, `initial_100k`, `initial_1m`, `mixed_100k`, `unchanged_100k`, `unchanged_100k_full`, `recovery_100k`, `sustained_100k`, `batch_500`, `batch_2000`, `batch_5000`. The SQL for the test table is in `bench/sql/`. `Airbyte.Demo.Util.ResetConnection("bench")` clears the IRIS side of the benchmark connection; drop the table with `bench/sql/drop_items.sql`.
+Each run adds a row to `bench/results/results.csv`; the connection `bench` and the table `bench_items` are the only things changed. Set `BENCH_VERSION=before` (or any label) to tag the rows of a run; the default is `after`. Scenarios: `initial_10k`, `initial_100k`, `initial_1m`, `mixed_100k`, `unchanged_100k`, `unchanged_100k_full`, `recovery_100k`, `sustained_100k`, `batch_500`, `batch_2000`, `batch_5000`. The SQL for the test table is in `bench/sql/`. `Airbyte.Demo.Util.ResetConnection("bench")` clears the IRIS side of the benchmark connection; drop the table with `bench/sql/drop_items.sql`.

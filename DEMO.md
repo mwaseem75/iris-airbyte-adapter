@@ -251,5 +251,6 @@ Or remove everything, including volumes: `docker compose down -v`.
 | The run output says `temporary error ... retry 1 of 3` | The worker or the source was not reachable. The run repeats from the saved state after 5, 10 and 20 s; the Run row shows `Retries` |
 | `Skipped ... worker is busy (409)` or `another run is active` | A previous run is still going. Wait 30 seconds and try again |
 | The connector cannot reach Postgres | Check `docker compose ps`. The connector uses `host.docker.internal:5433`; change `POSTGRES_HOST_PORT` in `.env` if 5433 is taken (and the `port` in the `ConnectorConfig` setting of Extract) |
+| After loading the classes by hand (`LoadDir`) a run behaves as before, or `Store` shows no `StoreSeconds` | A running production keeps the old code in its jobs. Restart the production after loading classes: `do ##class(Ens.Director).RestartProduction()` (a container restart does this by itself) |
 | Counts differ from this page | A step was already run. Use "Start again" and continue from step 4 |
 | The first run is slow | The first run after a start takes longer (about 45 s) |

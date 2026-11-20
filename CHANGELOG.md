@@ -31,6 +31,12 @@ All notable changes to this project are listed here. The format follows [Keep a 
 - `Util.ResetConnection(connectionId)` clears the records, runs, rejected records, status and saved state of one connection and leaves the others alone. A disabled `ExtractBench` item in the demo production reads the benchmark table.
 - The Run table has a new column `StoreSeconds` (time spent storing batches). The worker reports `bytes_produced` for a read. `RunNow` accepts a batch size and a mode for one run.
 
+- Faster store: the worker sends a hash of each record and IRIS only compares it, and an unchanged record is found through the index without opening it. Storing 100,000 new records takes about a third less time in IRIS (see `bench/REPORT.md`).
+- Shorter run start-up: the worker reuses the discovered stream list of a connector instead of starting the connector once more for every read (`CATALOG_CACHE_TTL_SECONDS`, default 3600, `0` = off). A run that reads almost nothing is about 6 to 8 seconds faster.
+- Batch files are deleted as soon as IRIS has committed them (`POST /reads/{id}/batches/{n}/ack`), so the worker's read folder stays small on large reads. Batch files of a failed or cancelled read are deleted when the read ends.
+- The read status shows `timings` per phase (process start, discover, connector start, connector read).
+- Debug switch to time each phase of the store (`^Airbyte.Demo.ProfileOn`), off by default.
+
 ### Changed
 
 - `ReadTimeout` now limits the whole run (default 600 s); each HTTP call to the worker has its own 30 s timeout. The Store operation has two jobs.

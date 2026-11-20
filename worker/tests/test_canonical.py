@@ -83,7 +83,7 @@ def test_no_key_defined_is_flagged():
 
 def test_output_shape():
     out = canonical.to_output("customers", {"id": 1, "_airbyte_x": 1}, SCHEMA, ["id"])
-    assert out == {"stream": "customers", "key": ["1"], "data": {"id": 1}}
+    assert out == {"stream": "customers", "key": ["1"], "data": {"id": 1}, "hash": canonical.data_hash({"id": 1})}
     bad = canonical.to_output("customers", {"name": "x"}, SCHEMA, ["id"])
     assert bad["key"] is None and bad["key_error"] == "missing_key_field:id"
 
@@ -110,3 +110,17 @@ def test_state_only_passed_for_incremental_streams_and_nulls_stripped():
 def test_integer_declared_as_number_with_airbyte_type_stays_integer():
     assert canonical.convert_record(load('{"id": 42}'), SCHEMA)["id"] == 42
     assert canonical.convert_record({"id": Decimal("42")}, SCHEMA)["id"] == 42
+
+
+def test_data_hash_does_not_depend_on_field_order_but_on_values():
+    a = canonical.data_hash({"b": 1, "a": "x"})
+    assert a == canonical.data_hash({"a": "x", "b": 1})
+    assert a != canonical.data_hash({"a": "x", "b": 2})
+    assert a != canonical.data_hash({"a": "x", "b": "1"})  # 1 and "1" are different values
+    assert len(a) == 64
+
+
+def test_data_hash_keeps_unicode_and_null_and_nested_order():
+    assert canonical.data_hash({"n": None, "t": "café €"}) != canonical.data_hash({"n": "", "t": "café €"})
+    # only the top-level field names are sorted; nested content keeps its order
+    assert canonical.data_hash({"o": {"b": 1, "a": 2}}) != canonical.data_hash({"o": {"a": 2, "b": 1}})

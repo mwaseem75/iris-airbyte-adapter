@@ -38,7 +38,7 @@ COLUMNS = ["timestamp", "scenario", "rows_in_source", "batch_size", "records_rea
            "unchanged", "rejected", "retries", "total_s", "extract_s", "store_s", "records_per_s", "mb_per_s",
            "peak_mem_mb_worker", "peak_mem_mb_iris", "peak_mem_mb_postgres", "peak_mem_mb_connector",
            "peak_cpu_pct_worker", "peak_cpu_pct_iris", "peak_cpu_pct_postgres", "peak_cpu_pct_connector",
-           "staging_peak_mb", "status", "iris_rows"]
+           "staging_peak_mb", "status", "iris_rows", "version"]
 
 
 def run(cmd: list[str], stdin: str | None = None, check: bool = True, timeout: int | None = None) -> str:
@@ -253,6 +253,7 @@ def execute(label: str, batch: int, max_seconds: int | None = None, cancel_after
         "records_per_s": round(read / total, 1) if total else 0,
         "mb_per_s": round(nbytes / 1e6 / total, 2) if total else 0,
         "staging_peak_mb": round(sampler.staging_mb, 1), "status": status, "iris_rows": iris_rows(),
+        "version": os.getenv("BENCH_VERSION", "after"),
     }
     for c in ("worker", "iris", "postgres", "connector"):
         row[f"peak_mem_mb_{c}"] = round(sampler.peak_mem.get(c, 0), 0)

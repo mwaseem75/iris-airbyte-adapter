@@ -28,6 +28,7 @@ Extraction runs outside IRIS on purpose: connectors bring their own runtimes (Ja
 | GET | `/reads/{id}` | Status (`running`, `completed`, `failed`, `cancelled`) with progress: records so far per stream, key errors, `batches_ready`. Final counts, batches, sync modes and duration when completed; `error {category, message}` when failed |
 | GET | `/reads/{id}/batches/{n}` | One batch of records; available as soon as it is written, also while the read runs. `409 not_ready` if not written yet and the read is running; `404` if the read has finished and has no batch n |
 | GET | `/reads/{id}/state` | Source state after the read; only for completed reads |
+| POST | `/reads/{id}/batches/{n}/ack` | Batch n is committed in IRIS: delete its file now, also while the read runs, so the read folder does not grow with the size of the read. Repeating it is harmless |
 | POST | `/reads/{id}/ack` | The caller has stored every batch and the state: delete the read's batch files (`status.json`, `progress.json` and `state.json` stay). Only for completed reads (`409 not_completed` otherwise); repeating it is harmless |
 | DELETE | `/reads/{id}` | Stop a running read (kills its process and its connector container); status becomes `cancelled`, no state. `409 not_running` for a finished read |
 
@@ -61,6 +62,14 @@ IRIS does not know which connector it talks to. The Extract service has `Connect
 - **Batch messages.** Store has the setting `ClearBatchBodies` (default 1). After a batch is committed, the record data in the stored `Batch` message is emptied, so message storage keeps the headers and counts (Visual Trace still shows every message) but no second copy of the data. Set it to 0 to keep the data in the messages for debugging.
 - **Purge on a schedule.** Message headers and the Event Log still grow with every run. Schedule the standard purge task (`Ens.Util.Tasks.Purge`, System Management Portal > Task Manager) with `NumberOfDaysToKeep` 7, `KeepIntegrity` on and `BodiesToo` on, daily. Keep more days if you need a longer history.
 - **Worker.** After the state is saved, Extract calls `POST /reads/{id}/ack` and the worker deletes the batch files of that read. Each job's temp files (config with credentials, catalog, state) live in a folder of their own that is removed when the job ends, also after a timeout or a cancel; a startup sweep removes anything an earlier crash left. The connector's own log files do not contain the config or credentials (checked by searching `/data` and `/tmp` for the Postgres password after reads).
+
+## Speed
+
+- **Hash from the worker.** The worker puts a SHA-256 hash of each record's data (top-level field names sorted, the rest as it is, compact JSON) in the record. Store only compares it with the stored hash. It gives the same value the earlier IRIS code computed: checked on 100,000 stored records and seven records with quotes, control characters, unicode, nested values and null, with no difference, so nothing had to be reloaded. A record without a hash (an older worker) is hashed in IRIS.
+- **Lookup without opening the record.** Store finds a record through the unique index and reads only its stored hash; the record is opened only when it changed. A rerun with unchanged data does not open any record.
+- **Catalog cache.** Discovering the streams starts the connector, so a read used to start it twice. The worker keeps the discovered catalog for a connector, version and config (key: a salted hash of the config; the config itself is never written to disk) in `/data/catalogs` and reuses it for `CATALOG_CACHE_TTL_SECONDS` (default 3600, `0` turns the cache off). A stream that is not in the cached catalog triggers a new discovery, and `/discover` always asks the connector and refreshes the cache. A column added in the source shows up after the TTL or after a `/discover`.
+- **Where a run's time goes.** The read status has `timings` (seconds): `process_start` (starting the read process and importing PyAirbyte), `discover`, `connector_start` (until the connector's first message), `connector_read`, and whether the catalog came from the cache.
+- **Per-phase timing in Store (debug).** `set ^Airbyte.Demo.ProfileOn = 1` makes Store add the time of each phase (parse, serialize, hash, lookup, write, counters, commit) to `^Airbyte.Demo.Profile(runId, phase)`. It is off by default; remove the global to switch it off.
 
 ## Benchmark
 

@@ -402,6 +402,12 @@ Method StoreBatch(pRunId As %Integer, pConn As %String, pReadId As %String, pN A
             Set pRows(tS, "rejected") = $Get(pRows(tS, "rejected")) + $List(tParts, 4)
         }
     }
+    // every message of this batch is committed: the worker can delete the batch file now (best effort;
+    // the acknowledgement of the whole read at the end deletes what is left)
+    Try {
+        Do ..Call("POST", "/reads/"_pReadId_"/batches/"_pN_"/ack")
+    } Catch {
+    }
     Quit 0
 }
 

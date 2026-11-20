@@ -118,7 +118,7 @@ def test_cancel_stops_read_and_gives_no_state(api):
     assert wait_for(lambda: main._slots_used == 0)
     assert status(api, rid)["status"] == "cancelled"  # the reader thread did not overwrite it
     assert api.get(f"/reads/{rid}/state").status_code == 404
-    assert api.get(f"/reads/{rid}/batches/1").status_code == 200  # what was written stays readable
+    assert api.get(f"/reads/{rid}/batches/1").status_code == 404  # record data of a cancelled read is deleted
     assert api.get(f"/reads/{rid}/batches/2").status_code == 404
     assert api.delete(f"/reads/{rid}").json()["error"]["category"] == "not_running"
     assert start(api, connection_id="c1").status_code == 202  # connection is free again
@@ -192,3 +192,33 @@ def test_ack_only_for_completed_reads(api):
     assert r.status_code == 409 and r.json()["error"]["category"] == "not_completed"
     assert api.get(f"/reads/{rid}/batches/1").status_code == 200  # nothing was deleted
     assert api.post("/reads/r-nope/ack").status_code == 404
+
+
+def test_batch_ack_deletes_one_batch_while_the_read_runs(api, tmp_path):
+    rid = start(api).json()["read_id"]
+    assert wait_for(lambda: status(api, rid).get("batches_ready") == 1)
+    r = api.post(f"/reads/{rid}/batches/1/ack")
+    assert r.status_code == 200 and r.json()["deleted"] is True
+    assert not (tmp_path / rid / "batches" / "1.json").exists()
+    assert api.post(f"/reads/{rid}/batches/1/ack").status_code == 200  # repeating is harmless
+    api.fake.proceed.set()
+    assert wait_for(lambda: status(api, rid)["status"] == "completed")
+    assert (tmp_path / rid / "batches" / "2.json").exists()  # only the acknowledged batch was deleted
+    assert api.post("/reads/r-nope/batches/1/ack").status_code == 404
+
+
+def test_batches_of_a_failed_read_are_deleted(api, tmp_path):
+    api.fake.proceed.set()
+    api.fake.fail = WorkerError("connector", "boom")
+    rid = start(api).json()["read_id"]
+    assert wait_for(lambda: status(api, rid)["status"] == "failed")
+    assert list((tmp_path / rid / "batches").glob("*.json")) == []
+    assert (tmp_path / rid / "status.json").exists()
+
+
+def test_batches_of_a_cancelled_read_are_deleted(api, tmp_path):
+    rid = start(api).json()["read_id"]
+    assert wait_for(lambda: status(api, rid).get("batches_ready") == 1)
+    assert api.delete(f"/reads/{rid}").status_code == 200
+    assert wait_for(lambda: main._slots_used == 0)
+    assert list((tmp_path / rid / "batches").glob("*.json")) == []

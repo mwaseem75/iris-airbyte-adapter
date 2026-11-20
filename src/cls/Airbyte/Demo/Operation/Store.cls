@@ -51,8 +51,13 @@ ClassMethod ProcessBatch(pRequest As Airbyte.Demo.Msg.Batch) As %String
     Set tIns = 0, tUpd = 0, tUnc = 0, tRej = 0
     Set tRunId = pRequest.RunId, tStream = pRequest.Stream
     Set tT0 = $ZHorolog
+    // debug switch for timing per phase (see Lap); off unless ^Airbyte.Demo.ProfileOn is set
+    Set ^||ProfOn = +$Get(^Airbyte.Demo.ProfileOn)
+    Kill ^||Prof
     Try {
+        Set tP = $ZHorolog
         Set tRecs = ##class(%DynamicAbstractObject).%FromJSON(pRequest.Records)
+        Do ..Lap("1 parse batch", tP)
         TSTART
         Set tIter = tRecs.%GetIterator()
         While tIter.%GetNext(.tIdx, .tRec) {
@@ -68,6 +73,7 @@ ClassMethod ProcessBatch(pRequest As Airbyte.Demo.Msg.Batch) As %String
             }
         }
         Set tRead = tIns + tUpd + tUnc + tRej
+        Set tP = $ZHorolog
         Set tSecs = $Number($ZHorolog - tT0, 3)
         &sql(UPDATE Airbyte_Demo_Data.Run
              SET StoreSeconds = StoreSeconds + :tSecs, Inserted = Inserted + :tIns, Updated = Updated + :tUpd,
@@ -87,14 +93,35 @@ ClassMethod ProcessBatch(pRequest As Airbyte.Demo.Msg.Batch) As %String
         If SQLCODE < 0 {
             Throw ##class(%Exception.SQL).CreateFromSQLCODE(SQLCODE, %msg)
         }
+        Do ..Lap("7 counters", tP)
+        Set tP = $ZHorolog
         TCOMMIT
+        Do ..Lap("8 commit", tP)
     } Catch ex {
         If $TLevel > 0 {
             TROLLBACK
         }
         Throw ex
     }
+    If ^||ProfOn {
+        Set tPh = ""
+        For {
+            Set tPh = $Order(^||Prof(tPh), 1, tVal)
+            Quit:tPh=""
+            Set ^Airbyte.Demo.Profile(tRunId, tPh) = $Get(^Airbyte.Demo.Profile(tRunId, tPh)) + tVal
+        }
+        Set ^Airbyte.Demo.Profile(tRunId, "0 total in ProcessBatch") = $Get(^Airbyte.Demo.Profile(tRunId, "0 total in ProcessBatch")) + ($ZHorolog - tT0)
+        Set ^Airbyte.Demo.Profile(tRunId, "0 records") = $Get(^Airbyte.Demo.Profile(tRunId, "0 records")) + tIns + tUpd + tUnc + tRej
+    }
     Quit tIns_","_tUpd_","_tUnc_","_tRej
+}
+
+/// Debug only: add the time since pT0 to the phase pPhase (process-private, summed per batch)
+ClassMethod Lap(pPhase As %String, pT0 As %Decimal)
+{
+    If ^||ProfOn {
+        Set ^||Prof(pPhase) = $Get(^||Prof(pPhase)) + ($ZHorolog - pT0)
+    }
 }
 
 /// Returns "I" (inserted), "U" (updated), "N" (unchanged) or "R" (rejected). A rejected record is written
@@ -108,24 +135,45 @@ ClassMethod StoreRecord(pConnectionId As %String, pStream As %String, pRec As %D
         $$$ThrowOnError(##class(Airbyte.Demo.Data.Rejected).Add(pRunId, pBatchNo, pConnectionId, pStream, tReason, tPayload))
         Quit "R"
     }
+    Set tP = $ZHorolog
     Set tKey = pRec.%Get("key").%ToJSON()
     Set tData = pRec.%Get("data")
     Set tText = tData.%ToJSON()
-    Set tHash = ..CanonicalHash(tData)
+    Do ..Lap("2 serialize record", tP)
+    Set tP = $ZHorolog
+    // the worker sends the hash of the record data; compute it here only for a worker that does not
+    Set tHash = pRec.%Get("hash")
+    If tHash = "" {
+        Set tHash = ..CanonicalHash(tData)
+    }
+    Do ..Lap("3 hash", tP)
     Set tNow = $ZDateTime($ZTimeStamp, 3, 1, 3)
 
-    Set tObj = ##class(Airbyte.Demo.Data.Record).RecordIdxOpen(pConnectionId, pStream, tKey, , .tSC)
-    If $IsObject(tObj) {
-        If tObj.Hash = tHash {
+    Set tP = $ZHorolog
+    // index lookup first, the stored hash is read without opening the record: an unchanged record
+    // (the usual case on a rerun) is decided here
+    Set tId = ""
+    If ##class(Airbyte.Demo.Data.Record).RecordIdxExists(pConnectionId, pStream, tKey, .tId) {
+        If ##class(Airbyte.Demo.Data.Record).HashGetStored(tId) = tHash {
+            Do ..Lap("4 lookup", tP)
             Quit "N"
         }
+        Set tObj = ##class(Airbyte.Demo.Data.Record).%OpenId(tId)
+    } Else {
+        Set tObj = ""
+    }
+    Do ..Lap("4 lookup", tP)
+    If $IsObject(tObj) {
+        Set tP = $ZHorolog
         Do tObj.Data.Clear()
         Do tObj.Data.Write(tText)
         Set tObj.Hash = tHash
         Set tObj.LastUpdated = tNow
         $$$ThrowOnError(tObj.%Save())
+        Do ..Lap("6 write update", tP)
         Quit "U"
     }
+    Set tP = $ZHorolog
     Set tObj = ##class(Airbyte.Demo.Data.Record).%New()
     Set tObj.ConnectionId = pConnectionId
     Set tObj.Stream = pStream
@@ -135,6 +183,7 @@ ClassMethod StoreRecord(pConnectionId As %String, pStream As %String, pRec As %D
     Set tObj.FirstLoaded = tNow
     Set tObj.LastUpdated = tNow
     $$$ThrowOnError(tObj.%Save())
+    Do ..Lap("5 write insert", tP)
     Quit "I"
 }
 

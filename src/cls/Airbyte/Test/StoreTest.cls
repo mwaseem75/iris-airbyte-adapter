@@ -86,6 +86,21 @@ Method TestFailedBatchLeavesNothing()
     Do $$$AssertEquals($TLevel, 0, "no transaction left open")
 }
 
+/// The worker sends the hash of each record: Store only compares it with the stored one
+Method Test3HashFromTheWorkerDecidesChangedOrUnchanged()
+{
+    Set tRec = "[{""stream"":""customers"",""key"":[""h1""],""hash"":""aaa"",""data"":{""id"":9,""v"":1}}]"
+    Do $$$AssertEquals(##class(Airbyte.Demo.Operation.Store).ProcessBatch(..Batch(tRec, 10)), "1,0,0,0", "new record inserted")
+    Do $$$AssertEquals(##class(Airbyte.Demo.Operation.Store).ProcessBatch(..Batch(tRec, 11)), "0,0,1,0", "same hash: unchanged")
+    Set tChanged = "[{""stream"":""customers"",""key"":[""h1""],""hash"":""bbb"",""data"":{""id"":9,""v"":2}}]"
+    Do $$$AssertEquals(##class(Airbyte.Demo.Operation.Store).ProcessBatch(..Batch(tChanged, 12)), "0,1,0,0", "other hash: updated")
+    Set tRec2 = ##class(Airbyte.Demo.Data.Record).RecordIdxOpen("unittest", "customers", "[""h1""]")
+    Do $$$AssertEquals(tRec2.Hash, "bbb", "the hash from the worker is the stored hash")
+    Do $$$AssertEquals(##class(%DynamicAbstractObject).%FromJSON(tRec2.Data.Read(1000)).%Get("v"), 2, "data was replaced")
+    Set tRec2 = ""
+    Do $$$AssertEquals(##class(Airbyte.Demo.Operation.Store).ProcessBatch(..Batch(tChanged, 13)), "0,0,1,0", "and unchanged again")
+}
+
 Method TestConnectionStatus()
 {
     Set tSC = ##class(Airbyte.Demo.Data.ConnectionStatus).Record("unittest", 1, "Completed", "2026-11-20 10:00:00")

@@ -228,6 +228,12 @@ def _update_status(d: Path, **fields: Any) -> None:
             staging.write_json(d / "status.json", status)
 
 
+def _drop_batches(d: Path) -> None:
+    """Delete the batch files (record data) of a read that ended without being acknowledged."""
+    for f in (d / "batches").glob("*.json"):
+        f.unlink(missing_ok=True)
+
+
 def _batches_ready(d: Path) -> int:
     return (staging.read_json(d / "progress.json") or {}).get("batches_ready", 0)
 
@@ -251,12 +257,14 @@ def _execute_read(read_id: str, d: Path, payload: dict[str, Any], connection_id:
         if outcome == "failed":
             fields["error"] = {"category": e.category, "message": e.message}
         _update_status(d, **fields)
+        _drop_batches(d)
         log.warning("read %s %s: category=%s batches=%s in %ss", read_id, outcome, e.category,
                     _batches_ready(d), fields["duration_seconds"])
         return {"error": {"category": e.category, "message": e.message}}
     except Exception as e:  # noqa: BLE001 - never leave a read stuck in "running"
         _update_status(d, status="failed", error={"category": "internal", "message": type(e).__name__},
                        duration_seconds=round(time.monotonic() - t0, 2))
+        _drop_batches(d)
         log.error("read %s failed: internal (%s)", read_id, type(e).__name__)
         return {"error": {"category": "internal", "message": type(e).__name__}}
     finally:
@@ -352,6 +360,17 @@ def ack_read(read_id: str) -> Any:
     return {"read_id": read_id, "deleted_batches": deleted}
 
 
+@app.post("/reads/{read_id}/batches/{n}/ack")
+def ack_batch(read_id: str, n: int) -> Any:
+    """The caller has committed batch n: delete its file now instead of at the end of the read, so the
+    read folder does not grow with the size of the read. Repeating it is harmless."""
+    status = _status_of(read_id)
+    if not status:
+        return _error("not_found", f"unknown read: {read_id}")
+    (staging.read_dir(read_id) / "batches" / f"{n}.json").unlink(missing_ok=True)
+    return {"read_id": read_id, "batch": n, "deleted": True}
+
+
 @app.get("/reads/{read_id}/state")
 def read_state(read_id: str) -> Any:
     status = _status_of(read_id)
@@ -376,6 +395,7 @@ def mark_orphaned_reads() -> None:
         if status and status.get("status") == "running":
             _update_status(d, status="failed",
                            error={"category": "internal", "message": "worker restarted during the read"})
+            _drop_batches(d)
 
 
 def _valid_id(read_id: str) -> bool:

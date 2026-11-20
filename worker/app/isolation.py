@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -99,7 +100,7 @@ def run_isolated(op: str, payload: dict[str, Any], work_dir: Path | None = None,
         proc = subprocess.Popen([sys.executable, "-W", "ignore", "-m", "app.read_job", op, str(work)],
                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, text=True, start_new_session=True,
-                                env={**os.environ, JOB_ENV: job_id, "TMPDIR": str(tmp), "AIRBYTE_TEMP_DIR": str(tmp)})
+                                env={**os.environ, JOB_ENV: job_id, "WORKER_SPAWN_TS": str(time.time()), "TMPDIR": str(tmp), "AIRBYTE_TEMP_DIR": str(tmp)})
         with _lock:
             _procs[job_id] = proc
             was_cancelled = job_id in _cancelled

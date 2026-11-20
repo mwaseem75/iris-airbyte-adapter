@@ -3,8 +3,10 @@ result in <work_dir>/result.json. Run in its own process so a hang can be killed
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
+import time
 from pathlib import Path
 
 from app import runner, staging
@@ -71,6 +73,7 @@ def scrub(message: str, config: dict, secret_fields: list[str] | None = None) ->
 
 
 def main() -> None:
+    started_main = time.time()
     op, work = sys.argv[1], Path(sys.argv[2])
     payload = json.loads(sys.stdin.read())
     config = payload.get("config", {})
@@ -84,6 +87,9 @@ def main() -> None:
             result = runner.op_discover(payload)
         else:
             result = runner.op_read(payload, work)
+            spawned = os.getenv("WORKER_SPAWN_TS")
+            if spawned:  # time from starting this process until the read began (Python start, imports)
+                result.setdefault("timings", {})["process_start"] = round(started_main - float(spawned), 2)
         staging.write_json(work / "result.json", {"ok": True, "result": result})
     except runner.JobError as e:
         category = e.category if e.category != "connector" else classify(e.message)

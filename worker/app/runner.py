@@ -15,9 +15,9 @@ from pathlib import Path
 from typing import Any
 
 import airbyte as ab
-from airbyte_protocol.models import SyncMode
+from airbyte_protocol.models import AirbyteCatalog, SyncMode
 
-from app import canonical, staging
+from app import canonical, catalog_cache, staging
 
 TEMP_DIR = Path(os.getenv("AIRBYTE_TEMP_DIR", "/tmp/airbyte/tmp"))
 
@@ -54,10 +54,38 @@ def _pk(stream: Any) -> list[str]:
     return [path[0] for path in (stream.source_defined_primary_key or []) if path]
 
 
+class Laps:
+    """Seconds per phase of a read, to see where the fixed cost of a run goes."""
+
+    def __init__(self) -> None:
+        self.last = time.monotonic()
+        self.values: dict[str, Any] = {}
+
+    def mark(self, name: str) -> None:
+        now = time.monotonic()
+        self.values[name] = round(now - self.last, 2)
+        self.last = now
+
+
+def get_catalog(source: ab.Source, payload: dict[str, Any], names: list[str], refresh: bool = False) -> tuple[Any, str]:
+    """The connector's catalog. Discovering starts the connector, so a recent one for the same connector,
+    version and config is reused (see catalog_cache). Returns the catalog and 'hit', 'miss' or 'off'."""
+    key = catalog_cache.fingerprint(payload["connector"], payload["version"], payload["config"])
+    if not refresh:
+        cached = catalog_cache.load(key)
+        # a stream that is not in the cached catalog may be new in the source: discover again
+        if cached and set(names) <= {s["name"] for s in cached.get("streams", [])}:
+            source._discovered_catalog = AirbyteCatalog.model_validate(cached)  # undocumented attribute
+            return source.discovered_catalog, "hit"
+    catalog = source.discovered_catalog
+    catalog_cache.save(key, json.loads(catalog.model_dump_json(exclude_none=True)))
+    return catalog, ("miss" if catalog_cache.ttl_seconds() > 0 else "off")
+
+
 def op_discover(payload: dict[str, Any]) -> dict[str, Any]:
     source = make_source(payload)
     streams = []
-    for s in source.discovered_catalog.streams:
+    for s in get_catalog(source, payload, [], refresh=True)[0].streams:
         streams.append({
             "name": s.name,
             "namespace": s.namespace,
@@ -116,11 +144,15 @@ def _temp_file(content: str) -> str:
 
 def op_read(payload: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     started = time.monotonic()
+    laps = Laps()
     read_id = out_dir.name
     source = make_source(payload)
-    discovered_streams = {s.name: s for s in source.discovered_catalog.streams}
-    info = {n: {"default_cursor_field": s.default_cursor_field or []} for n, s in discovered_streams.items()}
+    laps.mark("make_source")
     specs = [{"name": s} if isinstance(s, str) else s for s in payload["streams"]]
+    catalog_all, catalog_state = get_catalog(source, payload, [s["name"] for s in specs])
+    laps.mark("discover")
+    discovered_streams = {s.name: s for s in catalog_all.streams}
+    info = {n: {"default_cursor_field": s.default_cursor_field or []} for n, s in discovered_streams.items()}
     plan = plan_streams(specs, info, payload.get("mode", "full_refresh"))
 
     source.select_streams(list(plan))
@@ -163,12 +195,17 @@ def op_read(payload: dict[str, Any], out_dir: Path) -> dict[str, Any]:
             progress()
 
     progress()
+    laps.mark("plan")
 
+    first_line = True
     try:
         lines = source.executor.execute(
             ["read", "--config", files[0], "--catalog", files[1], "--state", files[2]],
             suppress_stderr=True)
         for line in lines:
+            if first_line:
+                laps.mark("connector_start")  # until the connector's first message
+                first_line = False
             try:
                 msg = json.loads(line, parse_float=Decimal)
             except ValueError:
@@ -202,6 +239,7 @@ def op_read(payload: dict[str, Any], out_dir: Path) -> dict[str, Any]:
         raise JobError("connector", trace_error)
     flush()
     progress()
+    laps.mark("connector_read")
 
     new_state = list(last_state.values())  # the connector's own STATE messages, passed through
     staging.write_json(out_dir / "state.json", new_state)
@@ -211,6 +249,7 @@ def op_read(payload: dict[str, Any], out_dir: Path) -> dict[str, Any]:
         "key_errors": key_errors,
         "batches": batches,
         "bytes_produced": bytes_out,
+        "timings": {**laps.values, "catalog_cache": catalog_state},
         "sync_modes": {n: p["mode"] for n, p in plan.items()},
         "fell_back_to_full_refresh": [n for n, p in plan.items() if p["fallback"]],
         "duration_seconds": round(time.monotonic() - started, 2),

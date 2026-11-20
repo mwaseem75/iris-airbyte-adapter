@@ -4,6 +4,8 @@ Input values come from json.loads(..., parse_float=Decimal), so numbers keep the
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -82,12 +84,20 @@ def extract_key(data: dict[str, Any], key_fields: list[str] | None) -> tuple[lis
     return key, None
 
 
+def data_hash(data: dict[str, Any]) -> str:
+    """SHA-256 (hex) of the record data with the top-level field names in sorted order and everything
+    else as it is, as compact JSON. IRIS compares it with the hash of the stored record to tell changed
+    records from unchanged ones."""
+    canonical = {name: data[name] for name in sorted(data)}
+    return hashlib.sha256(json.dumps(canonical, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
 def to_output(stream: str, data: dict[str, Any], schema: dict[str, Any] | None,
               key_fields: list[str] | None) -> dict[str, Any]:
-    """The record handed to IRIS: {"stream", "key", "data"} plus "key_error" when the key is flagged."""
+    """The record handed to IRIS: {"stream", "key", "data", "hash"} plus "key_error" when the key is flagged."""
     converted = convert_record(data, schema)
     key, error = extract_key(converted, key_fields)
-    out: dict[str, Any] = {"stream": stream, "key": key, "data": converted}
+    out: dict[str, Any] = {"stream": stream, "key": key, "data": converted, "hash": data_hash(converted)}
     if error:
         out["key_error"] = error
     return out
