@@ -18,14 +18,23 @@ All notable changes to this project are listed here. The format follows [Keep a 
 - IRIS settings for any connector: `ConnectorName`, `ConnectorVersion`, `ConnectorConfig` (JSON without secrets) and `CredentialFields` (which config fields take their value from the IRIS Credentials entry, nested paths such as `tunnel_method.ssh_key=Password` allowed). A warning is logged if `ConnectorConfig` holds a value for a secret field.
 - Terminal helpers `Airbyte.Demo.Util.Spec()`, `Check()` and `Discover()` show the connector's settings, validate the connection and list the streams from IRIS.
 - First IRIS unit tests (`Airbyte.Test.BuildConfigTest`); the documented `%UnitTest.Manager` command now works in the container.
+- IRIS runs use async reads: the Extract service polls the worker and stores each batch as soon as it is ready, while the worker is still reading. Batches of one connection are stored strictly in order; different connections run in parallel (a disabled second item `Extract2` is in the demo production).
+- Retries with backoff for temporary errors (worker unreachable, HTTP 5xx, connection, timeout, internal): the whole read repeats from the last saved state, up to `MaxRetries` (default 3) with `BackoffSeconds` 5, 10, 20. New settings `PollInterval`, `HttpTimeout`, `MaxRetries`, `BackoffSeconds`.
+- Configuration problems (wrong credentials, invalid config) stop a run at once with status `ConfigError` and a message that says what to fix. The Run table has new columns `RetryCount` and `ErrorCategory`.
+- `CredentialFields` can name a different credentials entry per field (`credentials.client_secret=SalesforceApp.Password`), for connectors with more than two secrets.
 
 ### Changed
 
+- `ReadTimeout` now limits the whole run (default 600 s); each HTTP call to the worker has its own 30 s timeout. The Store operation has two jobs.
 - The Extract service no longer has Postgres-only settings (`SourceHost`, `SourcePort`, `SourceDatabase`); they are now fields inside `ConnectorConfig`.
 - Error messages hide the values of the fields the connector's spec marks as secret, instead of guessing from field names.
 - When a read times out or is cancelled, only that read's connector container is stopped. Before, every container of the same connector image was stopped, which would break reads running in parallel.
 - Reads that were running when the worker restarted are now marked as failed instead of staying "running" forever.
 - `POST /reads` still waits for the full result by default (`wait=true`), so existing callers keep working.
+
+### Fixed
+
+- A wrong password is now reported as an authentication error. Before, the worker only said "Connector failed" because the real reason was in the connector's log file; the worker now reads it from there.
 
 ## [0.0.1] - 2026-11-13
 

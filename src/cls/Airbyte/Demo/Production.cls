@@ -11,7 +11,7 @@ XData ProductionDefinition
 <Production Name="Airbyte.Demo.Production" TestingEnabled="true" LogGeneralTraceEvents="true">
   <Description>Demo: Postgres -> Airbyte source-postgres (worker) -> IRIS table</Description>
   <ActorPoolSize>1</ActorPoolSize>
-  <Item Name="Store" Category="" ClassName="Airbyte.Demo.Operation.Store" PoolSize="1" Enabled="true" Foreground="false" Comment="Insert-or-update, one transaction per batch" LogTraceEvents="true" Schedule="">
+  <Item Name="Store" Category="" ClassName="Airbyte.Demo.Operation.Store" PoolSize="2" Enabled="true" Foreground="false" Comment="Insert-or-update, one transaction per batch" LogTraceEvents="true" Schedule="">
   </Item>
   <Item Name="Extract" Category="" ClassName="Airbyte.Demo.Service.Extract" PoolSize="1" Enabled="true" Foreground="false" Comment="Polling is off; start runs with RunNow()" LogTraceEvents="true" Schedule="">
     <Setting Target="Adapter" Name="CallInterval">3600</Setting>
@@ -22,12 +22,25 @@ XData ProductionDefinition
     <Setting Target="Host" Name="CursorFields">customers=updated_at,suppliers=updated_at</Setting>
     <Setting Target="Host" Name="Mode">incremental</Setting>
     <Setting Target="Host" Name="BatchSize">500</Setting>
-    <Setting Target="Host" Name="ReadTimeout">120</Setting>
+    <Setting Target="Host" Name="ReadTimeout">600</Setting>
     <Setting Target="Host" Name="ConnectorName">source-postgres</Setting>
     <Setting Target="Host" Name="ConnectorVersion">3.8.11</Setting>
     <Setting Target="Host" Name="ConnectorConfig">{"host":"host.docker.internal","port":5433,"database":"demo","schemas":["public"],"ssl_mode":{"mode":"disable"},"replication_method":{"method":"Standard"},"tunnel_method":{"tunnel_method":"NO_TUNNEL"}}</Setting>
     <Setting Target="Host" Name="Credentials">Postgres</Setting>
     <Setting Target="Host" Name="CredentialFields">username=Username,password=Password</Setting>
+    <Setting Target="Host" Name="Target">Store</Setting>
+  </Item>
+  <Item Name="Extract2" Category="" ClassName="Airbyte.Demo.Service.Extract" PoolSize="1" Enabled="false" Foreground="false" Comment="Second connection, disabled: used to show two connections running at the same time (enable it, then RunNow(1, &quot;Extract2&quot;))" LogTraceEvents="true" Schedule="">
+    <Setting Target="Adapter" Name="CallInterval">3600</Setting>
+    <Setting Target="Host" Name="PollingEnabled">0</Setting>
+    <Setting Target="Host" Name="WorkerURL">http://worker:8000</Setting>
+    <Setting Target="Host" Name="ConnectionId">demo2</Setting>
+    <Setting Target="Host" Name="Streams">suppliers</Setting>
+    <Setting Target="Host" Name="CursorFields">suppliers=updated_at</Setting>
+    <Setting Target="Host" Name="Mode">incremental</Setting>
+    <Setting Target="Host" Name="BatchSize">500</Setting>
+    <Setting Target="Host" Name="ReadTimeout">600</Setting>
+    <Setting Target="Host" Name="Credentials">Postgres</Setting>
     <Setting Target="Host" Name="Target">Store</Setting>
   </Item>
 </Production>

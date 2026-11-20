@@ -10,7 +10,7 @@ Load records from Airbyte sources into InterSystems IRIS, with all setup and ope
 |---|---|---|
 | Worker | Own container, Python 3.11 | FastAPI service around PyAirbyte. Runs the Airbyte connector, converts values, returns records in batches and the new source state |
 | Airbyte connector | Docker container started by the worker | `airbyte/source-postgres`, the same image the Airbyte platform uses |
-| `Airbyte.Demo.Service.Extract` | IRIS | Business Service: settings, credentials, run lock, calls the worker, sends batches, saves state |
+| `Airbyte.Demo.Service.Extract` | IRIS | Business Service: settings, credentials, run lock, async read with polling, sends batches in order as they arrive, retries, saves state |
 | `Airbyte.Demo.Operation.Store` | IRIS | Business Operation: insert-or-update, one transaction per batch |
 | `Airbyte.Demo.Data.Record`, `Run` | IRIS | Stored records and run counters |
 
@@ -40,6 +40,15 @@ Record format:
 
 IRIS does not know which connector it talks to. The Extract service has `ConnectorName`, `ConnectorVersion`, `ConnectorConfig` (the connector's own settings as JSON, without secrets) and `CredentialFields` (`config.path=CredentialsProperty` pairs, dotted paths for nested fields). At run time `BuildConfig` puts the values from the IRIS Credentials entry into the config at those paths. The worker validates the config against the connector's spec before check, discover and read, and hides the spec's secret fields in error messages. `Util.Spec()`, `Util.Check()` and `Util.Discover()` show the spec, validate the connection and list the streams from the IRIS terminal.
 
+## Runs, ordering and retries (IRIS side)
+
+- **Pipelined.** Extract starts the read with `wait=false` and a `connection_id`, polls `GET /reads/{id}` every `PollInterval` seconds (default 2) and, as soon as `batches_ready` grows, fetches each new batch and sends it to Store while the worker is still reading. The state is fetched and saved only when the read is `completed` and every batch is stored. A failed or cancelled read, or a batch that did not store, stops the run without saving the state.
+- **Ordering rule.** Within one connection, batches are stored strictly in order, one at a time (a later batch can hold a newer version of a record an earlier batch already wrote). Parallelism is across connections: Extract items with different `ConnectionId` run at the same time and their records stay separate (the identity includes the connection). Store has two jobs for that reason. One run per `ConnectionId` at a time.
+- **Time limits.** `ReadTimeout` (default 600 s) limits the whole run, retries included. Each HTTP call to the worker uses `HttpTimeout` (default 30 s).
+- **Error handling.** Transient errors (worker unreachable, HTTP 5xx, categories `connection`, `timeout`, `internal`, `connector`) repeat the whole read from the last saved state, up to `MaxRetries` (default 3) times, waiting `BackoffSeconds * 2^(n-1)` (5, 10, 20 s). This is safe because the state moves only after commit and the upsert never duplicates. Configuration problems (`auth`, `config`, `validation`, `not_found`) stop the run at once with status `ConfigError` and a message telling the operator what to fix. A busy worker (409) skips the run. Anything else (cancelled, a batch that failed to store, an unexpected IRIS error) stops the run as `Failed` without retry. The Run table shows `RetryCount` and `ErrorCategory`.
+- **Counters across retries.** A retry reads again from the old state, so records stored by the failed attempt count as unchanged in the retry. The Run row adds up what every attempt stored.
+- **Credentials.** `CredentialFields` entries `path=Username` or `path=Password` use the entry from the `Credentials` setting. `path=Entry.Property` uses another credentials entry, so a connector with more than two secrets can use several entries.
+
 ## Rules the code follows
 
 - **State after commit.** The worker returns the new source state but never treats it as committed. IRIS saves it only after every batch is committed. A failed run leaves the state unchanged, so the next run reads again from the old position.
@@ -68,7 +77,8 @@ IRIS does not know which connector it talks to. The Extract service has `Connect
 ## Known limits
 
 - One tested source: Postgres through `source-postgres`.
-- A read takes 11-25 s before the first record because the Java connector starts. Records then arrive quickly (50,000 rows in about 24 s in total on a laptop).
+- A read takes 11-25 s before the first record because the Java connector starts. Records then arrive quickly (50,000 rows in about 24 s in the worker; about 25-30 s through IRIS, where storing is the slower part).
+- A wrong host or a stopped source is reported by the connector as a generic connector error, so it is retried like a temporary error before the run fails.
 - Timestamps from `timestamptz` columns come back in UTC (same instant, original offset not kept).
 - Rejected records are counted and logged, not stored.
 - Recovery beyond "state is saved only after commit" is not implemented yet.

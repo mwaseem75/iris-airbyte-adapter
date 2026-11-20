@@ -26,6 +26,27 @@ def short(message: str) -> str:
     return m.group(1) if m else message
 
 
+def log_reason(message: str) -> str | None:
+    """PyAirbyte's error only says 'Connector failed' and names the connector's log file. The real reason
+    (for example a wrong password) is in that file, in the connector's own error message."""
+    m = re.search(r"Log file: (\S+)", message)
+    if not m:
+        return None
+    try:
+        with open(m.group(1), encoding="utf-8", errors="replace") as f:
+            log = f.read()[-50000:]
+    except OSError:
+        return None
+    hits = re.findall(r'"error":\{"message":"((?:[^"\\]|\\.)*)"', log)
+    if hits:
+        try:
+            return json.loads(f'"{hits[-1]}"')
+        except ValueError:
+            return hits[-1]
+    hits = re.findall(r"State code: .*? Message: (.*)", log)
+    return hits[-1] if hits else None
+
+
 def values_at(config: Any, path: str) -> list[str]:
     """String values at a dotted path (lists are walked through)."""
     nodes = [config]
@@ -69,7 +90,7 @@ def main() -> None:
         staging.write_json(work / "result.json",
                            {"ok": False, "category": category, "message": scrub(e.message, config, secrets)})
     except Exception as e:  # noqa: BLE001
-        text = str(e)
+        text = log_reason(str(e)) or str(e)
         staging.write_json(work / "result.json",
                            {"ok": False, "category": classify(text), "message": scrub(text, config, secrets)})
 

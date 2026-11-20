@@ -2,6 +2,35 @@
 Class Airbyte.Test.BuildConfigTest Extends %UnitTest.TestCase
 {
 
+/// A second credentials entry, for fields that use another entry than the Credentials setting
+Method OnBeforeAllTests() As %Status
+{
+    Set tCred = ##class(Ens.Config.Credentials).%OpenId("AirbyteTestApp")
+    If '$IsObject(tCred) {
+        Set tCred = ##class(Ens.Config.Credentials).%New()
+        Set tCred.SystemName = "AirbyteTestApp"
+    }
+    Set tCred.Username = "app-user"
+    Set tCred.Password = "app-secret"
+    Quit tCred.%Save()
+}
+
+Method OnAfterAllTests() As %Status
+{
+    Quit ##class(Ens.Config.Credentials).%DeleteId("AirbyteTestApp")
+}
+
+Method TestOtherCredentialsEntry()
+{
+    Set tConfig = ##class(Airbyte.Demo.Service.Extract).BuildConfig("{}", "username=Username,password=Password,credentials.client_secret=AirbyteTestApp.Password,credentials.client_id=AirbyteTestApp.Username", ..Cred())
+    Do $$$AssertEquals(tConfig.password, "s3cret-value", "plain Password uses the default entry")
+    Do $$$AssertEquals(tConfig.%Get("credentials").%Get("client_secret"), "app-secret", "entry.Password uses the named entry")
+    Do $$$AssertEquals(tConfig.%Get("credentials").%Get("client_id"), "app-user", "entry.Username uses the named entry")
+    Set tMsg = ..Failure("{}", "x=NoSuchEntry.Password", ..Cred())
+    Do $$$AssertTrue(tMsg [ "credentials entry 'NoSuchEntry' not found", "unknown entry is reported")
+    Do $$$AssertTrue(tMsg '[ "s3cret", "message has no secret")
+}
+
 Method Cred(pUser As %String = "demo", pPass As %String = "s3cret-value") As Ens.Config.Credentials [ Private ]
 {
     Set tCred = ##class(Ens.Config.Credentials).%New()

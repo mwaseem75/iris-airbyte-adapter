@@ -159,7 +159,7 @@ ClassMethod Discover()
 ClassMethod Runs()
 {
     Write !
-    Do ##class(%SQL.Statement).%ExecDirect(, "SELECT RunId, Status, RecordsRead AS Rd, Inserted AS Ins, Updated AS Upd, Unchanged AS Unch, Rejected AS Rej FROM Airbyte_Demo_Data.Run ORDER BY ID").%Display()
+    Do ##class(%SQL.Statement).%ExecDirect(, "SELECT RunId, Status, RecordsRead AS Rd, Inserted AS Ins, Updated AS Upd, Unchanged AS Unch, Rejected AS Rej, RetryCount AS Retries, ErrorCategory AS ErrCat FROM Airbyte_Demo_Data.Run ORDER BY ID").%Display()
 }
 
 /// The source state IRIS has stored (what the next read starts from)

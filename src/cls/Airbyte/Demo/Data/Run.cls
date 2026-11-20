@@ -11,7 +11,7 @@ Property Started As %TimeStamp;
 
 Property Ended As %TimeStamp;
 
-/// Running, Completed, Failed, Skipped
+/// Running, Completed, Failed, Skipped, ConfigError (the operator must fix something; no retry)
 Property Status As %String(MAXLEN = 20);
 
 /// Records returned by the worker (READ is a reserved SQL word, hence the SQL field name)
@@ -27,6 +27,12 @@ Property Rejected As %Integer [ InitialExpression = 0 ];
 
 /// Error or skip reason (never record data or credentials)
 Property Message As %String(MAXLEN = 500);
+
+/// How many times the run was repeated after a temporary error
+Property RetryCount As %Integer [ InitialExpression = 0 ];
+
+/// Category of the last error (auth, config, unreachable, connection, timeout, internal, store, busy ...)
+Property ErrorCategory As %String(MAXLEN = 30);
 
 Index ConnIdx On ConnectionId;
 

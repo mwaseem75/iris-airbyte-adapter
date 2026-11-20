@@ -246,7 +246,9 @@ Or remove everything, including volumes: `docker compose down -v`.
 | Symptom | What to do |
 |---|---|
 | `Status()` shows `STOPPED` | `iris "##class(Airbyte.Demo.Production).Setup()"`, or press Start on the Production page |
-| A run says `timeout` | The read took longer than 120 s and was stopped; the state was not saved. Run it again. If it repeats: `docker compose restart worker` |
+| A run says `timeout` | The run took longer than the `ReadTimeout` setting (600 s) and was stopped; the state was not saved. Run it again. If it repeats: `docker compose restart worker` |
+| A run says `ConfigError` | The message says what to fix, for example `authentication failed: check the credentials entry 'Postgres'`. Nothing is retried. Fix it and run again (`Production.Setup()` recreates the demo credentials) |
+| The run output says `temporary error ... retry 1 of 3` | The worker or the source was not reachable. The run repeats from the saved state after 5, 10 and 20 s; the Run row shows `Retries` |
 | `Skipped ... worker is busy (409)` or `another run is active` | A previous run is still going. Wait 30 seconds and try again |
 | The connector cannot reach Postgres | Check `docker compose ps`. The connector uses `host.docker.internal:5433`; change `POSTGRES_HOST_PORT` in `.env` if 5433 is taken (and the `port` in the `ConnectorConfig` setting of Extract) |
 | Counts differ from this page | A step was already run. Use "Start again" and continue from step 4 |

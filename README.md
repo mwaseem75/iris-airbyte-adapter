@@ -79,7 +79,7 @@ Step-by-step walkthrough with expected results: [`DEMO.md`](DEMO.md). Design not
 ## Known limits (prototype)
 
 - One tested source: Postgres via `source-postgres`. The IRIS side is connector-neutral (settings `ConnectorName`, `ConnectorVersion`, `ConnectorConfig` as JSON, `CredentialFields`), but the worker only runs connectors listed in `ALLOWED_CONNECTORS` (default `source-postgres`).
-- The IRIS demo waits for each read to finish (about 25 s, because the Java connector starts). The worker can also run reads in the background (`wait=false`) with progress, batches available while reading, and cancel; the IRIS side does not use this yet.
+- Each run takes at least about 12 s because the Java connector starts. IRIS stores batches while the worker is still reading; 50,000 rows take about 25-30 s in total.
 - Incremental reads need a cursor column (e.g. `updated_at`); Airbyte returns the boundary row again on each run, counted as unchanged.
 - Recovery beyond "state is saved only after commit" is not implemented yet.
 - Demo credentials only; not for production use.

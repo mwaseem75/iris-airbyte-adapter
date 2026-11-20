@@ -13,7 +13,7 @@ Class Airbyte.Demo.Service.Extract Extends Ens.BusinessService
 
 Parameter ADAPTER = "Ens.InboundAdapter";
 
-Parameter SETTINGS = "WorkerURL:Connection,ConnectionId:Connection,Streams:Connection,CursorFields:Connection,Mode:Connection,BatchSize:Connection,ConnectorName:Connection,ConnectorVersion:Connection,ConnectorConfig:Connection,Credentials:Connection:credentialsSelector,CredentialFields:Connection,ReadTimeout:Connection,PollingEnabled:Basic,Target:Basic";
+Parameter SETTINGS = "WorkerURL:Connection,ConnectionId:Connection,Streams:Connection,CursorFields:Connection,Mode:Connection,BatchSize:Connection,ConnectorName:Connection,ConnectorVersion:Connection,ConnectorConfig:Connection,Credentials:Connection:credentialsSelector,CredentialFields:Connection,ReadTimeout:Connection,HttpTimeout:Connection,PollInterval:Connection,MaxRetries:Connection,BackoffSeconds:Connection,PollingEnabled:Basic,Target:Basic";
 
 /// Base URL of the worker, as seen from IRIS
 Property WorkerURL As %String(MAXLEN = 300) [ InitialExpression = "http://worker:8000" ];
@@ -42,12 +42,25 @@ Property ConnectorConfig As %String(MAXLEN = 20000) [ InitialExpression = "{""ho
 /// Ens.Config.Credentials entry holding the secrets
 Property Credentials As %String [ InitialExpression = "Postgres" ];
 
-/// Which config fields get their value from the Credentials entry: config path=Credentials property,
-/// comma separated. Nested fields use dots, for example credentials.client_secret=Password.
+/// Which config fields get their value from a credentials entry: config path=Property, comma separated.
+/// Property alone (Username, Password) comes from the Credentials setting. Another entry is named in front,
+/// for example credentials.client_secret=SalesforceApp.Password. Nested config fields use dots.
 Property CredentialFields As %String(MAXLEN = 500) [ InitialExpression = "username=Username,password=Password" ];
 
-/// HTTP timeout in seconds for the worker calls (a read takes about 25 s)
-Property ReadTimeout As %Integer [ InitialExpression = 120 ];
+/// Time limit in seconds for the whole run, retries included
+Property ReadTimeout As %Integer [ InitialExpression = 600 ];
+
+/// Timeout in seconds for each single HTTP call to the worker
+Property HttpTimeout As %Integer [ InitialExpression = 30 ];
+
+/// Seconds between status checks while the worker reads
+Property PollInterval As %Integer [ InitialExpression = 2 ];
+
+/// How often a run is repeated after a temporary error (worker unreachable, HTTP 5xx, connection, timeout, internal)
+Property MaxRetries As %Integer [ InitialExpression = 3 ];
+
+/// Wait before retry n is BackoffSeconds * 2^(n-1): 5, 10, 20 s by default
+Property BackoffSeconds As %Integer [ InitialExpression = 5 ];
 
 /// 0 = runs only start with RunNow()
 Property PollingEnabled As %Boolean [ InitialExpression = 0 ];
@@ -64,10 +77,11 @@ Method OnProcessInput(pInput As %RegisteredObject, Output pOutput As %Registered
     Quit ..Run(tManual && (pInput.StringValue = "verbose"))
 }
 
-/// Start one run now (production must be running). Prints a summary.
-ClassMethod RunNow(pVerbose As %Boolean = 1) As %Status
+/// Start one run now (production must be running). Prints a summary. pItem is the name of the Extract
+/// item in the production (a second connection uses its own item).
+ClassMethod RunNow(pVerbose As %Boolean = 1, pItem As %String = "Extract") As %Status
 {
-    Set tSC = ##class(Ens.Director).CreateBusinessService("Extract", .tService)
+    Set tSC = ##class(Ens.Director).CreateBusinessService(pItem, .tService)
     If $$$ISERR(tSC) {
         Quit tSC
     }
@@ -91,6 +105,39 @@ Method Run(pVerbose As %Boolean = 0) As %Status
     Quit tSC
 }
 
+/// How an error is handled, from the worker's error category and the HTTP status (0 if there was none):
+///   busy      the worker is full or has a read for this connection: skip, no retry
+///   config    something the operator must fix (auth, config, validation, not_found): stop, no retry
+///   transient worth retrying: worker unreachable, HTTP 5xx, categories connection, timeout, internal, connector
+///   permanent anything else (cancelled, store errors, other 4xx): stop, no retry
+ClassMethod Classify(pCategory As %String, pHttpStatus As %Integer = 0) As %String
+{
+    If (pHttpStatus = 409) || (pCategory = "busy") {
+        Quit "busy"
+    }
+    If $ListFind($ListBuild("auth", "config", "validation", "not_found"), pCategory) {
+        Quit "config"
+    }
+    If $ListFind($ListBuild("unreachable", "connection", "timeout", "internal", "connector"), pCategory) || (pHttpStatus >= 500) {
+        Quit "transient"
+    }
+    Quit "permanent"
+}
+
+ClassMethod IsTransient(pCategory As %String, pHttpStatus As %Integer = 0) As %Boolean
+{
+    Quit ..Classify(pCategory, pHttpStatus) = "transient"
+}
+
+/// Sentence for the operator when a run stops because of a configuration problem
+Method ConfigHint(pCategory As %String, pText As %String) As %String [ Private ]
+{
+    If pCategory = "auth" {
+        Quit "authentication failed: check the credentials entry '"_..Credentials_"'"
+    }
+    Quit "configuration problem ("_pCategory_"): "_pText
+}
+
 Method DoRun(pVerbose As %Boolean) As %Status
 {
     Set tRun = ##class(Airbyte.Demo.Data.Run).%New()
@@ -103,26 +150,70 @@ Method DoRun(pVerbose As %Boolean) As %Status
     }
     Set tRunId = tRun.%Id()
     Set tRun = ""
-    Set tRead = 0, tStatus = "Completed", tMessage = "", tSC = $$$OK
-    Try {
-        Set tRead = ..Extract(tRunId, pVerbose)
-    } Catch ex {
-        Set tErr = ex.AsStatus()
-        Set tMessage = $Extract($System.Status.GetOneStatusText(tErr), 1, 500)
-        If ex.Name = "WorkerBusy" {
-            Set tStatus = "Skipped"
+    // ReadTimeout limits the whole run, retries included
+    Set tDeadline = $ZHorolog + ..ReadTimeout
+    Set tRead = 0, tStatus = "Completed", tMessage = "", tCategory = "", tSC = $$$OK
+    Set tRetries = 0, tDone = 0
+    While 'tDone {
+        Set tFailed = 0
+        Try {
+            Set tRead = ..Extract(tRunId, pVerbose, tDeadline, (tRetries = 0))
+        } Catch ex {
+            Set tFailed = 1
+            Set tErr = ex.AsStatus()
+            If $ListFind($ListBuild("WorkerBusy", "WorkerError", "ConfigError", "RunTimeout", "StoreError"), ex.Name) {
+                Set tCategory = $Select(ex.Name = "WorkerBusy":"busy", ex.Name = "ConfigError":"config", ex.Name = "RunTimeout":"timeout", ex.Name = "StoreError":"store", 1:ex.Location)
+                Set tText = ex.Data
+                Set tHttp = $Select(ex.Name = "WorkerError":ex.Code, 1:0)
+                Set tClass = $Select(ex.Name = "RunTimeout":"permanent", 1:..Classify(tCategory, tHttp))
+            } Else {
+                // unexpected error inside IRIS: not a worker problem, so no retry
+                Set tCategory = "iris", tClass = "permanent"
+                Set tText = $System.Status.GetOneStatusText(tErr)
+            }
+            Set tText = $Extract(tText, 1, 400)
+        }
+        If 'tFailed {
+            Set tDone = 1
+            If tRetries {
+                Set tMessage = "completed after "_tRetries_" retr"_$Select(tRetries = 1:"y", 1:"ies")_" (last error: "_tCategory_")"
+            }
+        } ElseIf tClass = "busy" {
+            Set tDone = 1, tStatus = "Skipped", tMessage = tText
             $$$LOGWARNING("worker is busy (409); run "_tRunId_" skipped, no retry")
+        } ElseIf tClass = "config" {
+            Set tDone = 1, tStatus = "ConfigError", tSC = tErr
+            Set tMessage = $Extract(..ConfigHint(tCategory, tText), 1, 500)
+            $$$LOGERROR("run "_tRunId_" stopped, configuration problem ("_tCategory_"): "_tMessage)
+        } ElseIf tClass = "transient" {
+            Set tWait = ..BackoffSeconds * (2 ** tRetries)
+            If (tRetries >= ..MaxRetries) || ($ZHorolog + tWait >= tDeadline) {
+                Set tDone = 1, tStatus = "Failed", tSC = tErr
+                Set tMessage = $Extract("failed after "_tRetries_" retries: "_tCategory_": "_tText, 1, 500)
+                $$$LOGERROR("run "_tRunId_" failed after "_tRetries_" retries ("_tCategory_")")
+            } Else {
+                Set tRetries = tRetries + 1
+                $$$LOGWARNING("run "_tRunId_": temporary error ("_tCategory_"), retry "_tRetries_" of "_..MaxRetries_" in "_tWait_" s")
+                &sql(UPDATE Airbyte_Demo_Data.Run SET RetryCount = :tRetries, ErrorCategory = :tCategory WHERE ID = :tRunId)
+                If pVerbose {
+                    Write !,"temporary error (",tCategory,"); retry ",tRetries," of ",..MaxRetries," in ",tWait," s",!
+                }
+                Hang tWait
+            }
         } Else {
-            Set tStatus = "Failed"
-            Set tSC = tErr
-            $$$LOGERROR("run "_tRunId_" failed: "_tMessage)
+            Set tDone = 1, tStatus = "Failed", tSC = tErr
+            Set tMessage = $Extract(tCategory_": "_tText, 1, 500)
+            $$$LOGERROR("run "_tRunId_" failed ("_tCategory_")")
         }
     }
     Set tEnded = $ZDateTime($ZTimeStamp, 3, 1, 3)
-    &sql(UPDATE Airbyte_Demo_Data.Run SET Status = :tStatus, Ended = :tEnded, RecordsRead = :tRead, Message = :tMessage WHERE ID = :tRunId)
+    If tStatus = "Completed" {
+        Set tCategory = $Select(tRetries:tCategory, 1:"")
+    }
+    &sql(UPDATE Airbyte_Demo_Data.Run SET Status = :tStatus, Ended = :tEnded, RecordsRead = :tRead, Message = :tMessage, RetryCount = :tRetries, ErrorCategory = :tCategory WHERE ID = :tRunId)
     If pVerbose {
         &sql(SELECT RecordsRead, Inserted, Updated, Unchanged, Rejected INTO :r, :i, :u, :n, :j FROM Airbyte_Demo_Data.Run WHERE ID = :tRunId)
-        Write "run ",tRunId,": ",tStatus," read=",r," inserted=",i," updated=",u," unchanged=",n," rejected=",j
+        Write "run ",tRunId,": ",tStatus," read=",r," inserted=",i," updated=",u," unchanged=",n," rejected=",j," retries=",tRetries
         If tMessage '= "" {
             Write " (",tMessage,")"
         }
@@ -131,14 +222,17 @@ Method DoRun(pVerbose As %Boolean) As %Status
     Quit tSC
 }
 
-/// Calls the worker, sends every batch to the operation, then saves the new state. Throws on any failure.
-/// Returns the number of records read.
-Method Extract(pRunId As %Integer, pVerbose As %Boolean) As %Integer
+/// Starts the read in the worker (async), stores every batch in order while the worker is still reading,
+/// then saves the new state. Throws on any failure and then does NOT save the state. Each attempt starts
+/// from the state saved by the last successful run. Returns the number of records read.
+Method Extract(pRunId As %Integer, pVerbose As %Boolean, pDeadline As %Decimal, pWarn As %Boolean = 1) As %Integer
 {
     Set tConn = ..ConnectionId
-    Set tBody = ..SourceBody(1)
+    Set tBody = ..SourceBody(pWarn)
     Do tBody.%Set("mode", ..Mode)
     Do tBody.%Set("batch_size", +..BatchSize, "number")
+    Do tBody.%Set("connection_id", tConn)
+    Do tBody.%Set("wait", 0, "boolean")
     Set tStreams = []
     Set tList = $ListFromString(..Streams, ",")
     For i = 1:1:$ListLength(tList) {
@@ -160,76 +254,69 @@ Method Extract(pRunId As %Integer, pVerbose As %Boolean) As %Integer
         Write !,"state BEFORE run: ",$Select(tStateBefore = "":"<none>", 1:tStateBefore),!
     }
 
-    // 1. read (synchronous, about 25 s)
-    Set tReq = ..NewRequest()
-    Set tReq.ContentType = "application/json"
-    Do tReq.EntityBody.Write(tBody.%ToJSON())
-    $$$ThrowOnError(tReq.Post("/reads"))
-    Set tCode = tReq.HttpResponse.StatusCode
-    Set tResp = ##class(%DynamicAbstractObject).%FromJSON(tReq.HttpResponse.Data)
-    If tCode = 409 {
-        Throw ##class(%Exception.General).%New("WorkerBusy", 409, , "worker is busy (409)")
-    }
-    If tCode '= 200 {
-        Throw ##class(%Exception.General).%New("WorkerError", tCode, , "worker returned "_tCode_" "_tResp.error.category_": "_tResp.error.message)
+    // 1. start the read; the worker answers at once
+    Set tResp = ..Call("POST", "/reads", tBody, .tCode)
+    If tCode '= 202 {
+        Do ..ThrowWorkerError(tCode, tResp)
     }
     Set tReadId = tResp.%Get("read_id")
-    Set tBatches = tResp.%Get("batches")
-    Set tRead = 0
-    Set tIt = tResp.counts.%GetIterator()
-    While tIt.%GetNext(.tStream, .tCount) {
-        Set tRead = tRead + tCount
-        Set tRows(tStream, "read") = tCount
-    }
-
-    // 2. every batch, one message per stream, synchronous; any failure throws and the state is NOT saved
-    For n = 1:1:tBatches {
-        Set tGet = ..NewRequest()
-        $$$ThrowOnError(tGet.Get("/reads/"_tReadId_"/batches/"_n))
-        If tGet.HttpResponse.StatusCode '= 200 {
-            Throw ##class(%Exception.General).%New("WorkerError", tGet.HttpResponse.StatusCode, , "batch "_n_" could not be fetched")
-        }
-        Set tBatch = ##class(%DynamicAbstractObject).%FromJSON(tGet.HttpResponse.Data)
-        Kill tPerStream
-        Set tIt = tBatch.records.%GetIterator()
-        While tIt.%GetNext(.tIdx, .tRec) {
-            Set tS = tRec.%Get("stream")
-            If '$Data(tPerStream(tS)) {
-                Set tPerStream(tS) = []
-            }
-            Do tPerStream(tS).%Push(tRec)
-        }
-        Set tS = ""
+    Set tNext = 1, tLastReady = -1, tOK = 0, tRead = 0
+    Try {
+        // 2. poll; every batch that is ready is stored (synchronously, one message per stream) before the next one
         For {
-            Set tS = $Order(tPerStream(tS))
-            Quit:tS=""
-            Set tMsg = ##class(Airbyte.Demo.Msg.Batch).%New()
-            Set tMsg.RunId = pRunId
-            Set tMsg.ConnectionId = tConn
-            Set tMsg.Stream = tS
-            Set tMsg.ReadId = tReadId
-            Set tMsg.BatchNo = n
-            Do tPerStream(tS).%ToJSON(tMsg.Records)
-            Set tRsp = ""
-            $$$ThrowOnError(..SendRequestSync(..Target, tMsg, .tRsp))
-            If $IsObject(tRsp) {
-                Set tParts = $ListFromString(tRsp.StringValue, ",")
-                Set tRows(tS, "inserted") = $Get(tRows(tS, "inserted")) + $List(tParts, 1)
-                Set tRows(tS, "updated") = $Get(tRows(tS, "updated")) + $List(tParts, 2)
-                Set tRows(tS, "unchanged") = $Get(tRows(tS, "unchanged")) + $List(tParts, 3)
-                Set tRows(tS, "rejected") = $Get(tRows(tS, "rejected")) + $List(tParts, 4)
+            If $ZHorolog > pDeadline {
+                Throw ##class(%Exception.General).%New("RunTimeout", 0, "timeout", "run time limit (ReadTimeout "_..ReadTimeout_" s) reached")
+            }
+            Set tSt = ..Call("GET", "/reads/"_tReadId, , .tCode)
+            If tCode '= 200 {
+                Do ..ThrowWorkerError(tCode, tSt)
+            }
+            Set tStatus = tSt.%Get("status")
+            If tStatus = "failed" {
+                Do ..ThrowWorkerError(0, tSt)
+            }
+            If tStatus = "cancelled" {
+                Throw ##class(%Exception.General).%New("WorkerError", 0, "cancelled", "the read was cancelled in the worker")
+            }
+            Set tReady = $Select(tStatus = "completed":tSt.%Get("batches"), 1:+tSt.%Get("batches_ready"))
+            If tReady '= tLastReady {
+                $$$LOGINFO("read "_tReadId_": status "_tStatus_", batches ready "_tReady_", stored "_(tNext - 1))
+                Set tLastReady = tReady
+            }
+            Set tWaiting = 0
+            While (tNext <= tReady) && 'tWaiting {
+                Set tWaiting = ..StoreBatch(pRunId, tConn, tReadId, tNext, .tRows)
+                Set:'tWaiting tNext = tNext + 1
+            }
+            If (tStatus = "completed") && (tNext > tReady) {
+                Quit
+            }
+            Hang ..PollInterval
+        }
+        Set tIt = tSt.%Get("counts").%GetIterator()
+        While tIt.%GetNext(.tStream, .tCount) {
+            Set tRead = tRead + tCount
+            Set tRows(tStream, "read") = tCount
+        }
+
+        // 3. all batches stored OK and the read completed: only now fetch and save the new state
+        Set tSResp = ..Call("GET", "/reads/"_tReadId_"/state", , .tCode)
+        If tCode '= 200 {
+            Do ..ThrowWorkerError(tCode, tSResp)
+        }
+        Set tNewState = tSResp.%Get("state").%ToJSON()
+        Set ^Airbyte.Demo.State(tConn) = tNewState
+        Set tOK = 1
+    } Catch ex {
+        If 'tOK {
+            // stop the worker's read; best effort
+            Try {
+                Do ..Call("DELETE", "/reads/"_tReadId)
+            } Catch {
             }
         }
+        Throw ex
     }
-
-    // 3. all batches returned OK: only now fetch and save the new state
-    Set tSGet = ..NewRequest()
-    $$$ThrowOnError(tSGet.Get("/reads/"_tReadId_"/state"))
-    If tSGet.HttpResponse.StatusCode '= 200 {
-        Throw ##class(%Exception.General).%New("WorkerError", tSGet.HttpResponse.StatusCode, , "state could not be fetched")
-    }
-    Set tNewState = ##class(%DynamicAbstractObject).%FromJSON(tSGet.HttpResponse.Data).%Get("state").%ToJSON()
-    Set ^Airbyte.Demo.State(tConn) = tNewState
     If pVerbose {
         Set tStream = ""
         For {
@@ -242,11 +329,106 @@ Method Extract(pRunId As %Integer, pVerbose As %Boolean) As %Integer
     Quit tRead
 }
 
+/// Fetch batch pN and send it to the operation, one message per stream. Returns 1 if the batch is not
+/// written yet (the worker answered not_ready), 0 when it was stored. Throws on any other failure.
+Method StoreBatch(pRunId As %Integer, pConn As %String, pReadId As %String, pN As %Integer, ByRef pRows) As %Boolean [ Private ]
+{
+    Set tBatch = ..Call("GET", "/reads/"_pReadId_"/batches/"_pN, , .tCode)
+    If tCode = 409 {
+        Quit 1
+    }
+    If tCode '= 200 {
+        Do ..ThrowWorkerError(tCode, tBatch)
+    }
+    Kill tPerStream
+    Set tIt = tBatch.records.%GetIterator()
+    While tIt.%GetNext(.tIdx, .tRec) {
+        Set tS = tRec.%Get("stream")
+        If '$Data(tPerStream(tS)) {
+            Set tPerStream(tS) = []
+        }
+        Do tPerStream(tS).%Push(tRec)
+    }
+    Set tS = ""
+    For {
+        Set tS = $Order(tPerStream(tS))
+        Quit:tS=""
+        Set tMsg = ##class(Airbyte.Demo.Msg.Batch).%New()
+        Set tMsg.RunId = pRunId
+        Set tMsg.ConnectionId = pConn
+        Set tMsg.Stream = tS
+        Set tMsg.ReadId = pReadId
+        Set tMsg.BatchNo = pN
+        Do tPerStream(tS).%ToJSON(tMsg.Records)
+        Set tRsp = ""
+        Set tSC = ..SendRequestSync(..Target, tMsg, .tRsp)
+        If $$$ISERR(tSC) {
+            Throw ##class(%Exception.General).%New("StoreError", 0, "store", "batch "_pN_" was not stored: "_$Extract($System.Status.GetOneStatusText(tSC), 1, 300))
+        }
+        If $IsObject(tRsp) {
+            Set tParts = $ListFromString(tRsp.StringValue, ",")
+            Set pRows(tS, "inserted") = $Get(pRows(tS, "inserted")) + $List(tParts, 1)
+            Set pRows(tS, "updated") = $Get(pRows(tS, "updated")) + $List(tParts, 2)
+            Set pRows(tS, "unchanged") = $Get(pRows(tS, "unchanged")) + $List(tParts, 3)
+            Set pRows(tS, "rejected") = $Get(pRows(tS, "rejected")) + $List(tParts, 4)
+        }
+    }
+    Quit 0
+}
+
+/// Throw the error the worker reported (HTTP status pCode, 0 when it comes from a read's status)
+Method ThrowWorkerError(pCode As %Integer, pResp As %DynamicObject) [ Private ]
+{
+    Set tCat = "", tMsg = ""
+    If $IsObject(pResp) && pResp.%IsDefined("error") && $IsObject(pResp.%Get("error")) {
+        Set tErr = pResp.%Get("error")
+        Set tCat = tErr.%Get("category"), tMsg = tErr.%Get("message")
+        If tErr.%IsDefined("details") {
+            Set tIt = tErr.%Get("details").%GetIterator()
+            While tIt.%GetNext(.tI, .tD) {
+                Set tMsg = tMsg_"; "_tD.%Get("path")_" "_tD.%Get("reason")
+            }
+        }
+    }
+    If ..Classify(tCat, pCode) = "busy" {
+        Throw ##class(%Exception.General).%New("WorkerBusy", 409, "busy", "worker is busy (409): "_tMsg)
+    }
+    Throw ##class(%Exception.General).%New("WorkerError", pCode, tCat, "worker "_$Select(pCode:"returned "_pCode_" ", 1:"reported ")_tCat_": "_tMsg)
+}
+
+/// Call the worker (pVerb GET, POST or DELETE). Returns the parsed answer; pCode is the HTTP status.
+/// Throws WorkerError with category unreachable if there is no answer.
+Method Call(pVerb As %String, pPath As %String, pBody As %DynamicObject = "", Output pCode As %Integer) As %DynamicObject
+{
+    Set tReq = ..NewRequest()
+    If $IsObject(pBody) {
+        Set tReq.ContentType = "application/json"
+        Do tReq.EntityBody.Write(pBody.%ToJSON())
+    }
+    If pVerb = "GET" {
+        Set tSC = tReq.Get(pPath)
+    } ElseIf pVerb = "DELETE" {
+        Set tSC = tReq.Delete(pPath)
+    } Else {
+        Set tSC = tReq.Post(pPath)
+    }
+    If $$$ISERR(tSC) {
+        Throw ##class(%Exception.General).%New("WorkerError", 0, "unreachable", "worker not reachable at "_..WorkerURL)
+    }
+    Set pCode = tReq.HttpResponse.StatusCode
+    Set tResp = {}
+    Try {
+        Set tResp = ##class(%DynamicAbstractObject).%FromJSON(tReq.HttpResponse.Data)
+    } Catch {
+    }
+    Quit tResp
+}
+
 /// {connector, version, config} for the worker. The config is ConnectorConfig plus the values from the
 /// Credentials entry. Throws if ConnectorConfig or CredentialFields is wrong. Never log the result.
 Method SourceBody(pWarn As %Boolean = 0) As %DynamicObject
 {
-    $$$ThrowOnError(##class(Ens.Config.Credentials).GetCredentialsObj(.tCred, $ClassName(), "Ens.Config.Credentials", ..Credentials))
+    Set tCred = ..CredFor(..Credentials)
     Set tConfig = ..BuildConfig(..ConnectorConfig, ..CredentialFields, tCred)
     If pWarn {
         Do ..WarnSecrets(..ConnectorConfig)
@@ -272,16 +454,23 @@ ClassMethod BuildConfig(pConfigJSON As %String, pCredFields As %String, pCred As
         Continue:tPair=""
         Set tPath = $ZStrip($Piece(tPair, "=", 1), "<>W")
         Set tProp = $ZStrip($Piece(tPair, "=", 2), "<>W")
+        Set tCredUse = pCred
+        If tProp [ "." {
+            // entry.Property: another credentials entry (an entry name may itself contain dots)
+            Set tEntry = $Piece(tProp, ".", 1, $Length(tProp, ".") - 1)
+            Set tProp = $Piece(tProp, ".", $Length(tProp, "."))
+            Set tCredUse = ..CredFor(tEntry)
+        }
         If (tPath = "") || (tProp = "") || ($Length(tPair, "=") '= 2) {
             Throw ##class(%Exception.General).%New("ConfigError", 5001, "BuildConfig", "CredentialFields entry '"_tPair_"' must look like path=Property")
         }
-        If '$IsObject(pCred) {
+        If '$IsObject(tCredUse) {
             Throw ##class(%Exception.General).%New("ConfigError", 5001, "BuildConfig", "no credentials found for CredentialFields")
         }
-        If '##class(%Dictionary.CompiledProperty).%ExistsId(pCred.%ClassName(1)_"||"_tProp) {
+        If '##class(%Dictionary.CompiledProperty).%ExistsId(tCredUse.%ClassName(1)_"||"_tProp) {
             Throw ##class(%Exception.General).%New("ConfigError", 5001, "BuildConfig", "credentials have no property '"_tProp_"' (for config path '"_tPath_"')")
         }
-        Set tValue = $Property(pCred, tProp)
+        Set tValue = $Property(tCredUse, tProp)
         If tValue = "" {
             Throw ##class(%Exception.General).%New("ConfigError", 5001, "BuildConfig", "credential property '"_tProp_"' is empty (for config path '"_tPath_"')")
         }
@@ -307,6 +496,16 @@ ClassMethod BuildConfig(pConfigJSON As %String, pCredFields As %String, pCred As
         Do tNode.%Set(tLeaf, tValue)
     }
     Quit tConfig
+}
+
+/// Credentials object of a named Ens.Config.Credentials entry. Throws ConfigError if it does not exist.
+ClassMethod CredFor(pEntry As %String) As %RegisteredObject
+{
+    Set tSC = ##class(Ens.Config.Credentials).GetCredentialsObj(.tCred, $ClassName(), "Ens.Config.Credentials", pEntry)
+    If $$$ISERR(tSC) || '$IsObject($Get(tCred)) {
+        Throw ##class(%Exception.General).%New("ConfigError", 5001, "BuildConfig", "credentials entry '"_pEntry_"' not found")
+    }
+    Quit tCred
 }
 
 /// The string at a dotted path in a JSON object, or "" if it is missing or not a simple value
@@ -342,12 +541,7 @@ Method WarnSecrets(pConfigJSON As %String) [ Private ]
 /// POST a JSON body to the worker and return the parsed answer; pCode is the HTTP status
 Method PostJSON(pPath As %String, pBody As %DynamicObject, Output pCode As %Integer) As %DynamicObject
 {
-    Set tReq = ..NewRequest()
-    Set tReq.ContentType = "application/json"
-    Do tReq.EntityBody.Write(pBody.%ToJSON())
-    $$$ThrowOnError(tReq.Post(pPath))
-    Set pCode = tReq.HttpResponse.StatusCode
-    Quit ##class(%DynamicAbstractObject).%FromJSON(tReq.HttpResponse.Data)
+    Quit ..Call("POST", pPath, pBody, .pCode)
 }
 
 /// The connector's spec from the worker: connection_specification (JSON Schema) and secret_fields
@@ -366,7 +560,7 @@ Method NewRequest() As %Net.HttpRequest [ Private ]
     Do ##class(%Net.URLParser).Parse(..WorkerURL, .tUrl)
     Set tReq.Server = tUrl("host")
     Set tReq.Port = $Get(tUrl("port"), 80)
-    Set tReq.Timeout = ..ReadTimeout
+    Set tReq.Timeout = ..HttpTimeout
     Quit tReq
 }
 
