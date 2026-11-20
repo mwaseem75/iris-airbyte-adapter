@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
+
+# ObjectScript package Airbyte.Demo.Data is source code, not data
+!/src/cls/Airbyte/Demo/Data/

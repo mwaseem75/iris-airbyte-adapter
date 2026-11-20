@@ -13,7 +13,7 @@ Class Airbyte.Demo.Service.Extract Extends Ens.BusinessService
 
 Parameter ADAPTER = "Ens.InboundAdapter";
 
-Parameter SETTINGS = "WorkerURL:Connection,ConnectionId:Connection,Streams:Connection,CursorFields:Connection,Mode:Connection,BatchSize:Connection,ConnectorName:Connection,ConnectorVersion:Connection,ConnectorConfig:Connection,Credentials:Connection:credentialsSelector,CredentialFields:Connection,ReadTimeout:Connection,HttpTimeout:Connection,PollInterval:Connection,MaxRetries:Connection,BackoffSeconds:Connection,PollingEnabled:Basic,Target:Basic";
+Parameter SETTINGS = "WorkerURL:Connection,ConnectionId:Connection,Streams:Connection,CursorFields:Connection,KeyFields:Connection,Mode:Connection,BatchSize:Connection,ConnectorName:Connection,ConnectorVersion:Connection,ConnectorConfig:Connection,Credentials:Connection:credentialsSelector,CredentialFields:Connection,ReadTimeout:Connection,HttpTimeout:Connection,PollInterval:Connection,MaxRetries:Connection,BackoffSeconds:Connection,PollingEnabled:Basic,Target:Basic";
 
 /// Base URL of the worker, as seen from IRIS
 Property WorkerURL As %String(MAXLEN = 300) [ InitialExpression = "http://worker:8000" ];
@@ -25,6 +25,10 @@ Property Streams As %String(MAXLEN = 500) [ InitialExpression = "customers,order
 
 /// Comma separated stream=cursor_field pairs. A stream without a cursor is read as full_refresh.
 Property CursorFields As %String(MAXLEN = 500) [ InitialExpression = "customers=updated_at,suppliers=updated_at" ];
+
+/// Comma separated stream=col1+col2 pairs: the columns that form the record key, for streams without a
+/// usable primary key. Records where one of them is missing or empty are rejected (see Util.Rejects()).
+Property KeyFields As %String(MAXLEN = 500);
 
 Property Mode As %String(VALUELIST = ",full_refresh,incremental") [ InitialExpression = "incremental" ];
 
@@ -151,7 +155,8 @@ Method DoRun(pVerbose As %Boolean) As %Status
     Set tRunId = tRun.%Id()
     Set tRun = ""
     // ReadTimeout limits the whole run, retries included
-    Set tDeadline = $ZHorolog + ..ReadTimeout
+    Set tT0 = $ZHorolog
+    Set tDeadline = tT0 + ..ReadTimeout
     Set tRead = 0, tStatus = "Completed", tMessage = "", tCategory = "", tSC = $$$OK
     Set tRetries = 0, tDone = 0
     While 'tDone {
@@ -210,7 +215,11 @@ Method DoRun(pVerbose As %Boolean) As %Status
     If tStatus = "Completed" {
         Set tCategory = $Select(tRetries:tCategory, 1:"")
     }
-    &sql(UPDATE Airbyte_Demo_Data.Run SET Status = :tStatus, Ended = :tEnded, RecordsRead = :tRead, Message = :tMessage, RetryCount = :tRetries, ErrorCategory = :tCategory WHERE ID = :tRunId)
+    Set tDuration = $Number($ZHorolog - tT0, 2)
+    &sql(UPDATE Airbyte_Demo_Data.Run SET Status = :tStatus, Ended = :tEnded, RecordsRead = :tRead, Message = :tMessage, RetryCount = :tRetries, ErrorCategory = :tCategory, DurationSeconds = :tDuration WHERE ID = :tRunId)
+    Do ##class(Airbyte.Demo.Data.ConnectionStatus).Record(..ConnectionId, tRunId, tStatus, tEnded, $Select(tStatus = "Completed":"", 1:tCategory), $Select(tStatus = "Completed":"", 1:tMessage))
+    &sql(SELECT RecordsRead, Inserted, Updated, Unchanged, Rejected INTO :lr, :li, :lu, :ln, :lj FROM Airbyte_Demo_Data.Run WHERE ID = :tRunId)
+    $$$LOGINFO("run "_tRunId_": connection="_..ConnectionId_" status="_tStatus_" read="_lr_" inserted="_li_" updated="_lu_" unchanged="_ln_" rejected="_lj_" duration="_tDuration_"s retries="_tRetries)
     If pVerbose {
         &sql(SELECT RecordsRead, Inserted, Updated, Unchanged, Rejected INTO :r, :i, :u, :n, :j FROM Airbyte_Demo_Data.Run WHERE ID = :tRunId)
         Write "run ",tRunId,": ",tStatus," read=",r," inserted=",i," updated=",u," unchanged=",n," rejected=",j," retries=",tRetries
@@ -233,6 +242,10 @@ Method Extract(pRunId As %Integer, pVerbose As %Boolean, pDeadline As %Decimal, 
     Do tBody.%Set("batch_size", +..BatchSize, "number")
     Do tBody.%Set("connection_id", tConn)
     Do tBody.%Set("wait", 0, "boolean")
+    Set tKeys = ..KeyFieldsObject()
+    If tKeys.%Size() {
+        Do tBody.%Set("key_fields", tKeys)
+    }
     Set tStreams = []
     Set tList = $ListFromString(..Streams, ",")
     For i = 1:1:$ListLength(tList) {
@@ -316,6 +329,15 @@ Method Extract(pRunId As %Integer, pVerbose As %Boolean, pDeadline As %Decimal, 
             }
         }
         Throw ex
+    }
+    // the state is saved: the worker can delete the batch files of this read (best effort)
+    Try {
+        Do ..Call("POST", "/reads/"_tReadId_"/ack", , .tAckCode)
+        If tAckCode '= 200 {
+            $$$LOGWARNING("worker did not accept the acknowledgement of read "_tReadId_" (HTTP "_tAckCode_")")
+        }
+    } Catch {
+        $$$LOGWARNING("could not acknowledge read "_tReadId_" to the worker")
     }
     If pVerbose {
         Set tStream = ""
@@ -562,6 +584,26 @@ Method NewRequest() As %Net.HttpRequest [ Private ]
     Set tReq.Port = $Get(tUrl("port"), 80)
     Set tReq.Timeout = ..HttpTimeout
     Quit tReq
+}
+
+/// KeyFields as {"stream": ["col1", "col2"]}
+Method KeyFieldsObject() As %DynamicObject [ Private ]
+{
+    Set tObj = {}
+    Set tList = $ListFromString(..KeyFields, ",")
+    For i = 1:1:$ListLength(tList) {
+        Set tPair = $ZStrip($List(tList, i), "<>W")
+        Continue:tPair=""
+        Set tName = $ZStrip($Piece(tPair, "=", 1), "<>W")
+        Set tCols = []
+        Set tColList = $ListFromString($Piece(tPair, "=", 2), "+")
+        For k = 1:1:$ListLength(tColList) {
+            Set tCol = $ZStrip($List(tColList, k), "<>W")
+            Do:tCol'="" tCols.%Push(tCol)
+        }
+        Do:(tName'="")&&tCols.%Size() tObj.%Set(tName, tCols)
+    }
+    Quit tObj
 }
 
 Method CursorFor(pStream As %String) As %String [ Private ]

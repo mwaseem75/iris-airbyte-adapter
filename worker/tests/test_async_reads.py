@@ -168,3 +168,27 @@ def test_unknown_read(api):
     assert api.get("/reads/r-nope").status_code == 404
     assert api.delete("/reads/r-nope").status_code == 404
     assert api.get("/reads/r-nope/batches/1").status_code == 404
+
+
+def test_ack_deletes_batch_files_but_keeps_status_and_state(api, tmp_path):
+    api.fake.proceed.set()
+    rid = start(api).json()["read_id"]
+    assert wait_for(lambda: status(api, rid)["status"] == "completed")
+    d = tmp_path / rid
+    assert len(list((d / "batches").glob("*.json"))) == 2
+    r = api.post(f"/reads/{rid}/ack")
+    assert r.status_code == 200 and r.json()["deleted_batches"] == 2
+    assert list((d / "batches").glob("*.json")) == []
+    assert (d / "status.json").exists() and (d / "state.json").exists()
+    assert api.get(f"/reads/{rid}/batches/1").status_code == 404
+    assert api.get(f"/reads/{rid}/state").status_code == 200
+    assert api.post(f"/reads/{rid}/ack").json()["deleted_batches"] == 0  # repeating is harmless
+
+
+def test_ack_only_for_completed_reads(api):
+    rid = start(api).json()["read_id"]
+    assert wait_for(lambda: status(api, rid).get("batches_ready") == 1)
+    r = api.post(f"/reads/{rid}/ack")
+    assert r.status_code == 409 and r.json()["error"]["category"] == "not_completed"
+    assert api.get(f"/reads/{rid}/batches/1").status_code == 200  # nothing was deleted
+    assert api.post("/reads/r-nope/ack").status_code == 404

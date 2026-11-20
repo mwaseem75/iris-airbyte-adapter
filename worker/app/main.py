@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app import spec as specs, staging
-from app.isolation import READ_TIMEOUT_SECONDS, WorkerError, cancel as cancel_job, run_isolated
+from app.isolation import READ_TIMEOUT_SECONDS, WorkerError, cancel as cancel_job, run_isolated, sweep_temp
 
 DEFAULT_CONNECTOR = "source-postgres"
 DEFAULT_VERSION = "3.8.11"
@@ -39,7 +39,7 @@ _connections: set[str] = set()  # connection ids with an active read
 _status_lock = threading.Lock()  # status.json is rewritten by the read thread and by cancel
 
 STATUS_FOR = {"timeout": 504, "busy": 409, "not_found": 404, "config": 400, "validation": 400,
-              "not_ready": 409, "not_running": 409, "cancelled": 409}
+              "not_ready": 409, "not_running": 409, "not_completed": 409, "cancelled": 409}
 
 
 class SourceRequest(BaseModel):
@@ -331,6 +331,23 @@ def read_batch(read_id: str, n: int) -> Any:
     return _error("not_found", f"no batch {n} for read {read_id}")
 
 
+@app.post("/reads/{read_id}/ack")
+def ack_read(read_id: str) -> Any:
+    """The caller has stored every batch and the state: delete the batch files (data minimisation).
+    status.json, progress.json and state.json stay."""
+    status = _status_of(read_id)
+    if not status:
+        return _error("not_found", f"unknown read: {read_id}")
+    if status.get("status") != "completed":
+        return _error("not_completed", f"read {read_id} is not completed (status: {status.get('status')})")
+    deleted = 0
+    for f in (staging.read_dir(read_id) / "batches").glob("*.json"):
+        f.unlink(missing_ok=True)
+        deleted += 1
+    log.info("read %s acknowledged: %d batch files deleted", read_id, deleted)
+    return {"read_id": read_id, "deleted_batches": deleted}
+
+
 @app.get("/reads/{read_id}/state")
 def read_state(read_id: str) -> Any:
     status = _status_of(read_id)
@@ -345,7 +362,9 @@ def read_state(read_id: str) -> Any:
 
 @app.on_event("startup")
 def mark_orphaned_reads() -> None:
-    """A read left 'running' by a worker restart can never finish: say so."""
+    """A read left 'running' by a worker restart can never finish: say so. Also remove temp files
+    (they hold credentials) that a killed job left behind."""
+    log.info("startup: removed %d leftover temp item(s)", sweep_temp())
     if not staging.READS_DIR.exists():
         return
     for d in staging.READS_DIR.iterdir():

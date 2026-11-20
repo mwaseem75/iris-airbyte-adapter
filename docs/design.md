@@ -12,7 +12,7 @@ Load records from Airbyte sources into InterSystems IRIS, with all setup and ope
 | Airbyte connector | Docker container started by the worker | `airbyte/source-postgres`, the same image the Airbyte platform uses |
 | `Airbyte.Demo.Service.Extract` | IRIS | Business Service: settings, credentials, run lock, async read with polling, sends batches in order as they arrive, retries, saves state |
 | `Airbyte.Demo.Operation.Store` | IRIS | Business Operation: insert-or-update, one transaction per batch |
-| `Airbyte.Demo.Data.Record`, `Run` | IRIS | Stored records and run counters |
+| `Airbyte.Demo.Data.Record`, `Run`, `RunStream`, `ConnectionStatus`, `Rejected` | IRIS | Stored records, run counters (per run and per stream), where each connection stands, and records with a bad key |
 
 Extraction runs outside IRIS on purpose: connectors bring their own runtimes (Java, Python) and Docker, which should not run inside the database process.
 
@@ -28,6 +28,7 @@ Extraction runs outside IRIS on purpose: connectors bring their own runtimes (Ja
 | GET | `/reads/{id}` | Status (`running`, `completed`, `failed`, `cancelled`) with progress: records so far per stream, key errors, `batches_ready`. Final counts, batches, sync modes and duration when completed; `error {category, message}` when failed |
 | GET | `/reads/{id}/batches/{n}` | One batch of records; available as soon as it is written, also while the read runs. `409 not_ready` if not written yet and the read is running; `404` if the read has finished and has no batch n |
 | GET | `/reads/{id}/state` | Source state after the read; only for completed reads |
+| POST | `/reads/{id}/ack` | The caller has stored every batch and the state: delete the read's batch files (`status.json`, `progress.json` and `state.json` stay). Only for completed reads (`409 not_completed` otherwise); repeating it is harmless |
 | DELETE | `/reads/{id}` | Stop a running read (kills its process and its connector container); status becomes `cancelled`, no state. `409 not_running` for a finished read |
 
 Record format:
@@ -48,6 +49,18 @@ IRIS does not know which connector it talks to. The Extract service has `Connect
 - **Error handling.** Transient errors (worker unreachable, HTTP 5xx, categories `connection`, `timeout`, `internal`, `connector`) repeat the whole read from the last saved state, up to `MaxRetries` (default 3) times, waiting `BackoffSeconds * 2^(n-1)` (5, 10, 20 s). This is safe because the state moves only after commit and the upsert never duplicates. Configuration problems (`auth`, `config`, `validation`, `not_found`) stop the run at once with status `ConfigError` and a message telling the operator what to fix. A busy worker (409) skips the run. Anything else (cancelled, a batch that failed to store, an unexpected IRIS error) stops the run as `Failed` without retry. The Run table shows `RetryCount` and `ErrorCategory`.
 - **Counters across retries.** A retry reads again from the old state, so records stored by the failed attempt count as unchanged in the retry. The Run row adds up what every attempt stored.
 - **Credentials.** `CredentialFields` entries `path=Username` or `path=Password` use the entry from the `Credentials` setting. `path=Entry.Property` uses another credentials entry, so a connector with more than two secrets can use several entries.
+
+## Run history and rejected records
+
+- **History.** The Store operation writes the counts per run (`Run`) and per stream (`RunStream`) in the same transaction as each batch. `Run` also has `DurationSeconds`, `RetryCount` and `ErrorCategory`. At the end of every run the service updates one row per connection in `ConnectionStatus` (last run and status, last successful run and time, category and message of the last error; a skipped run does not overwrite the last error) and writes one Event Log line with connection, status, counts, duration and retries (no data). `Util.Runs()`, `Util.RunDetail(runId)` and `Util.Connections()` show it.
+- **Rejected records.** A record whose key is missing, empty or null is not stored. Store writes it to `Rejected` (run, batch, connection, stream, reason, the record data as JSON, status New or Ignored) in the same transaction as the batch. The reason never contains a value; the payload is only in that table, never in logs. `Util.Rejects()` lists them (`Util.Rejects(1)` with payload) and `Util.IgnoreRejected(id)` marks one as Ignored.
+- **How to fix a rejected record.** Fix it at the source (fill in the missing key value), or change which columns form the key with the `KeyFields` setting (`stream=col1+col2,...`, passed to the worker as `key_fields`, for streams without a usable primary key). The next run reads the record again and stores it. A record that is still wrong is rejected again and gets a new row for that run; rows are kept until you delete them.
+
+## Data minimisation
+
+- **Batch messages.** Store has the setting `ClearBatchBodies` (default 1). After a batch is committed, the record data in the stored `Batch` message is emptied, so message storage keeps the headers and counts (Visual Trace still shows every message) but no second copy of the data. Set it to 0 to keep the data in the messages for debugging.
+- **Purge on a schedule.** Message headers and the Event Log still grow with every run. Schedule the standard purge task (`Ens.Util.Tasks.Purge`, System Management Portal > Task Manager) with `NumberOfDaysToKeep` 7, `KeepIntegrity` on and `BodiesToo` on, daily. Keep more days if you need a longer history.
+- **Worker.** After the state is saved, Extract calls `POST /reads/{id}/ack` and the worker deletes the batch files of that read. Each job's temp files (config with credentials, catalog, state) live in a folder of their own that is removed when the job ends, also after a timeout or a cancel; a startup sweep removes anything an earlier crash left. The connector's own log files do not contain the config or credentials (checked by searching `/data` and `/tmp` for the Postgres password after reads).
 
 ## Rules the code follows
 
@@ -80,5 +93,4 @@ IRIS does not know which connector it talks to. The Extract service has `Connect
 - A read takes 11-25 s before the first record because the Java connector starts. Records then arrive quickly (50,000 rows in about 24 s in the worker; about 25-30 s through IRIS, where storing is the slower part).
 - A wrong host or a stopped source is reported by the connector as a generic connector error, so it is retried like a temporary error before the run fails.
 - Timestamps from `timestamptz` columns come back in UTC (same instant, original offset not kept).
-- Rejected records are counted and logged, not stored.
 - Recovery beyond "state is saved only after commit" is not implemented yet.

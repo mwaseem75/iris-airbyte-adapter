@@ -47,6 +47,10 @@ do ##class(Airbyte.Demo.Util).Check()               // validate the connection
 do ##class(Airbyte.Demo.Util).Discover()            // streams, keys, cursors, sync modes
 do ##class(Airbyte.Demo.Service.Extract).RunNow()   // first run: 13 read, 13 inserted
 do ##class(Airbyte.Demo.Util).Records()             // rows per stream
+do ##class(Airbyte.Demo.Util).Runs()                // run history with counts, duration, retries
+do ##class(Airbyte.Demo.Util).RunDetail(1)          // counts per stream for run 1
+do ##class(Airbyte.Demo.Util).Connections()         // last run and last success per connection
+do ##class(Airbyte.Demo.Util).Rejects()             // records rejected because of a bad key
 do ##class(Airbyte.Demo.Service.Extract).RunNow()   // rerun: 7 read, 7 unchanged, no duplicates
 do ##class(Airbyte.Demo.Util).Key()                 // key ["1"] stored once per stream
 ```

@@ -34,6 +34,9 @@ Property RetryCount As %Integer [ InitialExpression = 0 ];
 /// Category of the last error (auth, config, unreachable, connection, timeout, internal, store, busy ...)
 Property ErrorCategory As %String(MAXLEN = 30);
 
+/// Wall-clock seconds of the whole run, retries included
+Property DurationSeconds As %Numeric(SCALE = 2);
+
 Index ConnIdx On ConnectionId;
 
 }

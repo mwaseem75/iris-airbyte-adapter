@@ -159,7 +159,49 @@ ClassMethod Discover()
 ClassMethod Runs()
 {
     Write !
-    Do ##class(%SQL.Statement).%ExecDirect(, "SELECT RunId, Status, RecordsRead AS Rd, Inserted AS Ins, Updated AS Upd, Unchanged AS Unch, Rejected AS Rej, RetryCount AS Retries, ErrorCategory AS ErrCat FROM Airbyte_Demo_Data.Run ORDER BY ID").%Display()
+    Do ##class(%SQL.Statement).%ExecDirect(, "SELECT RunId, ConnectionId AS Conn, Status, RecordsRead AS Rd, Inserted AS Ins, Updated AS Upd, Unchanged AS Unch, Rejected AS Rej, RetryCount AS Retries, ErrorCategory AS ErrCat, DurationSeconds AS Secs FROM Airbyte_Demo_Data.Run ORDER BY ID").%Display()
+}
+
+/// Counts per stream for one run
+ClassMethod RunDetail(pRunId As %Integer)
+{
+    Write !
+    Do ##class(%SQL.Statement).%ExecDirect(, "SELECT RunId, Stream, RecordsRead AS Rd, Inserted AS Ins, Updated AS Upd, Unchanged AS Unch, Rejected AS Rej FROM Airbyte_Demo_Data.RunStream WHERE RunId = ? ORDER BY Stream", pRunId).%Display()
+}
+
+/// Where every connection stands: last run, last success, last error
+ClassMethod Connections()
+{
+    Write !
+    Do ##class(%SQL.Statement).%ExecDirect(, "SELECT ConnectionId, LastRunId AS LastRun, LastStatus, LastRunAt, LastSuccessRunId AS OkRun, LastSuccessAt AS OkAt, LastErrorCategory AS ErrCat, LastErrorMessage AS ErrMsg FROM Airbyte_Demo_Data.ConnectionStatus ORDER BY ConnectionId").%Display()
+}
+
+/// Rejected records (key missing or invalid). The payload is only shown with pPayload = 1.
+/// Fix them at the source or change KeyFields; the next run reads them again.
+ClassMethod Rejects(pPayload As %Boolean = 0)
+{
+    Write !
+    Do ##class(%SQL.Statement).%ExecDirect(, "SELECT ID, RunId, BatchNo AS Batch, ConnectionId AS Conn, Stream, Status, Reason FROM Airbyte_Demo_Data.Rejected ORDER BY ID").%Display()
+    If pPayload {
+        Write !
+        Set tRS = ##class(%SQL.Statement).%ExecDirect(, "SELECT ID FROM Airbyte_Demo_Data.Rejected ORDER BY ID")
+        While tRS.%Next() {
+            Set tObj = ##class(Airbyte.Demo.Data.Rejected).%OpenId(tRS.%Get("ID"))
+            Write "payload ",tObj.%Id(),": ",tObj.Payload.Read(500),!
+        }
+    }
+}
+
+/// Mark a rejected record as Ignored (it stays in the table)
+ClassMethod IgnoreRejected(pId As %Integer)
+{
+    Set tObj = ##class(Airbyte.Demo.Data.Rejected).%OpenId(pId)
+    If '$IsObject(tObj) {
+        Write !,"no rejected record ",pId,!
+        Quit
+    }
+    Set tObj.Status = "Ignored"
+    Write !,$Select($$$ISOK(tObj.%Save()):"rejected record "_pId_" marked Ignored", 1:"could not save"),!
 }
 
 /// The source state IRIS has stored (what the next read starts from)
@@ -173,6 +215,9 @@ ClassMethod Reset()
 {
     Do ##class(Airbyte.Demo.Data.Record).%KillExtent()
     Do ##class(Airbyte.Demo.Data.Run).%KillExtent()
+    Do ##class(Airbyte.Demo.Data.RunStream).%KillExtent()
+    Do ##class(Airbyte.Demo.Data.ConnectionStatus).%KillExtent()
+    Do ##class(Airbyte.Demo.Data.Rejected).%KillExtent()
     Kill ^Airbyte.Demo.State
     Write !,"IRIS side reset: records, runs and state cleared",!
 }

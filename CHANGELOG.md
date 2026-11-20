@@ -23,6 +23,10 @@ All notable changes to this project are listed here. The format follows [Keep a 
 - Configuration problems (wrong credentials, invalid config) stop a run at once with status `ConfigError` and a message that says what to fix. The Run table has new columns `RetryCount` and `ErrorCategory`.
 - `CredentialFields` can name a different credentials entry per field (`credentials.client_secret=SalesforceApp.Password`), for connectors with more than two secrets.
 
+- Run history: counts per run and per stream (`RunStream`), run duration, and a `ConnectionStatus` row per connection with the last run, the last successful load and the last error. One Event Log line per run. New helpers `Util.RunDetail(runId)` and `Util.Connections()`.
+- Rejected records: a record with a missing or invalid key is stored in a new `Rejected` table (reason and record data) in the same transaction as its batch, instead of only being counted. `Util.Rejects()` lists them and `Util.IgnoreRejected(id)` marks one as ignored. New `KeyFields` setting (`stream=col1+col2`) for streams without a usable primary key.
+- Data minimisation: the Store setting `ClearBatchBodies` (default on) empties the record data in the stored batch messages once a batch is committed; headers and counts stay for Visual Trace. After the state is saved, IRIS acknowledges the read and the worker deletes its batch files (`POST /reads/{id}/ack`).
+
 ### Changed
 
 - `ReadTimeout` now limits the whole run (default 600 s); each HTTP call to the worker has its own 30 s timeout. The Store operation has two jobs.
@@ -34,6 +38,7 @@ All notable changes to this project are listed here. The format follows [Keep a 
 
 ### Fixed
 
+- Config, catalog and state files that hold credentials were left in the worker's temp folder when a read was cancelled or timed out. Each job now has its own temp folder that is always removed, and the worker removes leftovers at startup.
 - A wrong password is now reported as an authentication error. Before, the worker only said "Connector failed" because the real reason was in the connector's log file; the worker now reads it from there.
 
 ## [0.0.1] - 2026-11-13
